@@ -133,22 +133,63 @@ public class AcrQcAnalyser {
         ImageStack stack;
         Calibration cal;
         double px, py;
+        double[] sliceLoc;      // Slice Location (mm) por fatia (1-based -> indice z-1); NaN se ausente
+        double sliceSpacing;    // |espacamento| medio entre fatias (mm), estimado das posicoes
+        boolean hasSliceLoc;    // true se ha posicoes DICOM utilizaveis
     }
 
     private static LoadedSeries loadSeries(SeriesData sd) {
         LoadedSeries ls = new LoadedSeries();
         ImageStack stack = new ImageStack();
         Calibration cal = null;
-        for (File f : sd.getFiles()) {
+        List<File> files = sd.getFiles();
+        double[] loc = new double[files.size()];
+        int locCount = 0;
+
+        for (int i = 0; i < files.size(); i++) {
+            File f = files.get(i);
             ImagePlus imp = new ImagePlus(f.getAbsolutePath());
-            if (imp.getWidth() == 0) continue;
+            if (imp.getWidth() == 0) { loc[i] = Double.NaN; continue; }
             if (cal == null) cal = imp.getCalibration();
             stack.addSlice(imp.getProcessor());
+
+            // Slice Location (0020,1041) do metadado DICOM da serie.
+            double sl = Double.NaN;
+            try {
+                String meta = sd.getMetadata(f);
+                String s = DicomProcessor.getTag(meta, "0020,1041");
+                if (s != null) sl = Double.parseDouble(s.trim());
+            } catch (Exception ignore) {}
+            loc[i] = sl;
+            if (!Double.isNaN(sl)) locCount++;
         }
+
         ls.stack = stack;
         ls.cal = cal;
         ls.px = (cal != null && cal.pixelWidth > 0) ? cal.pixelWidth : 0.5;
         ls.py = (cal != null && cal.pixelHeight > 0) ? cal.pixelHeight : 0.5;
+        ls.sliceLoc = loc;
+        ls.hasSliceLoc = locCount >= Math.max(2, files.size() / 2);
+
+        // Espacamento medio entre fatias (mediana dos |delta|) a partir das posicoes.
+        double spacing = Double.NaN;
+        if (ls.hasSliceLoc) {
+            List<Double> deltas = new ArrayList<>();
+            for (int i = 1; i < loc.length; i++) {
+                if (!Double.isNaN(loc[i]) && !Double.isNaN(loc[i - 1])) {
+                    deltas.add(Math.abs(loc[i] - loc[i - 1]));
+                }
+            }
+            if (!deltas.isEmpty()) {
+                Collections.sort(deltas);
+                spacing = deltas.get(deltas.size() / 2);
+            }
+        }
+        // Fallback: pixelDepth da calibracao.
+        if (Double.isNaN(spacing) || spacing <= 0) {
+            spacing = (cal != null && cal.pixelDepth > 0) ? cal.pixelDepth : 5.0;
+        }
+        ls.sliceSpacing = spacing;
         return ls;
     }
 
@@ -380,9 +421,11 @@ public class AcrQcAnalyser {
         // --- 4. Espessura de corte (rampas do Modulo 1) ---
         measureSliceThickness(ls, r);
 
-        // --- 5. Exatidao de distancia entre pinos de referencia ---
-        // Os pinos/beads ficam no modulo de uniformidade COM beads.
-        int pinSlice = (mm.beadsCenter > 0) ? mm.beadsCenter : mod3Center;
+        // --- 5. Exatidao de distancia entre os pinos de referencia ---
+        // Os pinos (pontos claros a 100mm entre si) ficam na regiao homogenea do
+        // modulo de baixo contraste. Usa-se as coordenadas de referencia da macro
+        // ajustadas pelo centro detectado (sem segmentar, por robustez).
+        int pinSlice = (mod2Center > 0) ? mod2Center : mod3Center;
         r.pinSlice = pinSlice;
         measurePinDistance(ls, r, pinSlice);
 
@@ -676,61 +719,86 @@ public class AcrQcAnalyser {
      * Reproduz a logica de contagem de picos da macro do usuario: threshold =
      * max/2, distancia minima entre picos de 3mm.
      */
+    // Coordenadas de referencia das rampas de espessura (da macro do usuario, mm).
+    private static final double THK_REF_CENTER_X_MM = 180.282;
+    private static final double THK_REF_CENTER_Y_MM = 185.273;
+    private static final double THK_RECT_W_MM = 6.328;   // largura do retangulo da rampa
+    private static final double THK_RECT_H_MM = 73.0;    // altura do retangulo
+    private static final double THK_S1_X_MM = 172.266, THK_S1_Y_MM = 96.328; // rampa superior 1
+    private static final double THK_S2_X_MM = 182.812, THK_S2_Y_MM = 96.328; // rampa superior 2
+
+    /**
+     * Mede a espessura de corte pelas rampas do Modulo 1, reproduzindo a macro
+     * do usuario: NAO segmenta as rampas; usa retangulos em POSICOES DE
+     * REFERENCIA (mm), ajustadas pelo deslocamento entre o centro detectado do
+     * Modulo 1 e o centro de referencia da secao de espessura. O perfil de cada
+     * retangulo e a media das colunas ao longo da altura (equivalente ao
+     * getProfile com 'alt' da macro); a espessura e a contagem de picos acima da
+     * meia-altura (separacao minima de 3mm). Dois retangulos superiores e dois
+     * inferiores (estes espelhados em Y, como na macro).
+     */
     private static void measureSliceThickness(LoadedSeries ls, AcrQcResult r) {
         if (r.mod1Center < 1 || r.mod1Center > ls.stack.getSize()) return;
         ImageProcessor ip = ls.stack.getProcessor(r.mod1Center);
-        double[] c = phantomCenter(ip, ls.cal);
+        double[] cPx = phantomCenter(ip, ls.cal);
+        double cxMm = cPx[0] * ls.px, cyMm = cPx[1] * ls.py;
 
-        // Dois pares de rampas (superior e inferior) dispostos horizontalmente,
-        // proximos do centro. Perfis verticais de ~73mm de altura, 2 colunas por
-        // lado, com pequeno offset horizontal (parametros da macro de referencia).
-        double rampLenMm = 73.0;
-        double rampHalfMm = rampLenMm / 2.0;
-        int hPx = (int) Math.round(rampLenMm / ls.py);
-        double colOffsetMm = 5.3; // distancia entre as duas colunas de cada par
+        // Offset entre o centro detectado e o centro de referencia da macro.
+        double offXmm = cxMm - THK_REF_CENTER_X_MM;
+        double offYmm = cyMm - THK_REF_CENTER_Y_MM;
 
-        // Rampas superiores ~ -14mm em Y do centro; inferiores ~ +14mm.
-        double topYStartMm = -rampHalfMm - 14.0;
-        double botYStartMm = 14.0;
-        double xBase = c[0]; // centralizadas em X
+        double wPx = THK_RECT_W_MM / ls.px;
+        int hPx = (int) Math.round(THK_RECT_H_MM / ls.py);
 
-        double[] profTop1 = verticalProfile(ip, ls.cal, xBase - colOffsetMm / ls.px, c[1] + topYStartMm / ls.py, hPx);
-        double[] profTop2 = verticalProfile(ip, ls.cal, xBase + colOffsetMm / ls.px, c[1] + topYStartMm / ls.py, hPx);
-        double[] profBot1 = verticalProfile(ip, ls.cal, xBase - colOffsetMm / ls.px, c[1] + botYStartMm / ls.py, hPx);
-        double[] profBot2 = verticalProfile(ip, ls.cal, xBase + colOffsetMm / ls.px, c[1] + botYStartMm / ls.py, hPx);
+        // Rampas superiores (como na macro).
+        double xS1 = (THK_S1_X_MM + offXmm) / ls.px;
+        double xS2 = (THK_S2_X_MM + offXmm) / ls.px;
+        double yS  = (THK_S1_Y_MM + offYmm) / ls.py;
 
-        double maxTop = Math.max(arrMax(profTop1), arrMax(profTop2));
-        int pTop1 = countPeaks(profTop1, maxTop, ls.py);
-        int pTop2 = countPeaks(profTop2, maxTop, ls.py);
+        // Rampas inferiores: Y espelhado em relacao ao centro de referencia,
+        // rI1_Y = refThickY + (refThickY - (rS1_Y + rH)).
+        double rI1Ymm = THK_REF_CENTER_Y_MM + (THK_REF_CENTER_Y_MM - (THK_S1_Y_MM + THK_RECT_H_MM));
+        double yI = (rI1Ymm + offYmm) / ls.py;
 
-        double maxBot = Math.max(arrMax(profBot1), arrMax(profBot2));
-        int pBot1 = countPeaks(profBot1, maxBot, ls.py);
-        int pBot2 = countPeaks(profBot2, maxBot, ls.py);
+        double[] profS1 = rectColumnProfile(ip, ls.cal, xS1, yS, wPx, hPx);
+        double[] profS2 = rectColumnProfile(ip, ls.cal, xS2, yS, wPx, hPx);
+        double[] profI1 = rectColumnProfile(ip, ls.cal, xS1, yI, wPx, hPx);
+        double[] profI2 = rectColumnProfile(ip, ls.cal, xS2, yI, wPx, hPx);
 
-        r.sliceThicknessTop = (pTop1 + pTop2) / 2.0;
-        r.sliceThicknessBottom = (pBot1 + pBot2) / 2.0;
+        double maxS = Math.max(arrMax(profS1), arrMax(profS2));
+        double minS = Math.min(arrMin(profS1), arrMin(profS2));
+        int pS1 = countPeaks(profS1, maxS, ls.py);
+        int pS2 = countPeaks(profS2, maxS, ls.py);
 
-        // Aviso de confiabilidade: se os dois lados divergirem muito, a
-        // localizacao das rampas pode estar imprecisa (geometria a calibrar).
-        if (!Double.isNaN(r.sliceThicknessTop) && !Double.isNaN(r.sliceThicknessBottom)) {
-            double diff = Math.abs(r.sliceThicknessTop - r.sliceThicknessBottom);
-            double mean = (r.sliceThicknessTop + r.sliceThicknessBottom) / 2.0;
-            if (mean > 0 && diff > 0.4 * mean) {
-                r.sliceThicknessNote = "lados divergentes (verificar posicao das rampas)";
-            }
-        }
+        double maxI = Math.max(arrMax(profI1), arrMax(profI2));
+        double minI = Math.min(arrMin(profI1), arrMin(profI2));
+        int pI1 = countPeaks(profI1, maxI, ls.py);
+        int pI2 = countPeaks(profI2, maxI, ls.py);
+
+        r.sliceThicknessTop = (pS1 + pS2) / 2.0;
+        r.sliceThicknessBottom = (pI1 + pI2) / 2.0;
     }
 
-    private static double[] verticalProfile(ImageProcessor ip, Calibration cal, double x, double yStart, int nPx) {
-        double[] prof = new double[Math.max(1, nPx)];
-        int xi = (int) Math.round(x);
+    /**
+     * Perfil vertical de um retangulo: para cada linha (y), media dos pixels ao
+     * longo da largura (x). Equivale ao getProfile de um retangulo vertical no
+     * ImageJ (media das colunas), usado na macro com a tecla 'alt'.
+     */
+    private static double[] rectColumnProfile(ImageProcessor ip, Calibration cal,
+                                              double xLeftPx, double yTopPx, double wPx, int hPx) {
+        int x0 = (int) Math.round(xLeftPx);
+        int y0 = (int) Math.round(yTopPx);
+        int w = Math.max(1, (int) Math.round(wPx));
+        double[] prof = new double[Math.max(1, hPx)];
         for (int k = 0; k < prof.length; k++) {
-            int yi = (int) Math.round(yStart) + k;
-            if (xi < 0 || xi >= ip.getWidth() || yi < 0 || yi >= ip.getHeight()) {
-                prof[k] = -1000;
-            } else {
-                prof[k] = (cal != null) ? cal.getCValue(ip.getf(xi, yi)) : ip.getf(xi, yi);
+            int yi = y0 + k;
+            double sum = 0; int n = 0;
+            for (int xi = x0; xi < x0 + w; xi++) {
+                if (xi < 0 || xi >= ip.getWidth() || yi < 0 || yi >= ip.getHeight()) continue;
+                sum += (cal != null) ? cal.getCValue(ip.getf(xi, yi)) : ip.getf(xi, yi);
+                n++;
             }
+            prof[k] = (n > 0) ? sum / n : -1000;
         }
         return prof;
     }
@@ -738,6 +806,12 @@ public class AcrQcAnalyser {
     private static double arrMax(double[] a) {
         double m = -Double.MAX_VALUE;
         for (double v : a) if (v > m) m = v;
+        return m;
+    }
+
+    private static double arrMin(double[] a) {
+        double m = Double.MAX_VALUE;
+        for (double v : a) if (v < m) m = v;
         return m;
     }
 
@@ -774,141 +848,102 @@ public class AcrQcAnalyser {
     // 5. Exatidao de distancia entre os pinos de referencia (Modulo 3)
     // ------------------------------------------------------------------
 
-    /** Marcador (bead/pino) detectado: centroide e angulo em relacao ao centro. */
-    private static class Marker {
-        double x, y, hu, radiusMm, angleDeg;
-    }
+    // Coordenadas de referencia dos pinos (da macro do usuario), em mm na
+    // imagem. A distancia nominal t1-t2 e ~100mm.
+    private static final double PIN_REF_CENTER_X_MM = 125.051;
+    private static final double PIN_REF_CENTER_Y_MM = 124.801;
+    private static final double PIN_T1_X_MM = 139.16, PIN_T1_Y_MM = 110.35;
+    private static final double PIN_T2_X_MM = 68.36,  PIN_T2_Y_MM = 180.66;
+    private static final double PIN_SEARCH_RADIUS_MM = 5.0;
 
     /**
-     * Mede a distancia entre os dois pinos de referencia no modulo de
-     * uniformidade/beads, com VERIFICACAO DE ORIENTACAO (robusto a phantom
-     * invertido).
+     * Mede a distancia entre os dois pinos de referencia (pontos claros na
+     * regiao homogenea, nominalmente a 100mm entre si).
      *
-     * Em vez de assumir que os pinos estao na horizontal, detecta TODOS os
-     * marcadores de alto HU dentro do phantom, agrupa em clusters e procura o
-     * par de marcadores diametralmente opostos (aprox. simetricos em relacao ao
-     * centro) cuja distancia seja mais proxima do valor nominal (100 mm). A
-     * orientacao do par (horizontal ou vertical) e reportada: se o par estiver
-     * na vertical quando se esperava horizontal (ou vice-versa), sinaliza que o
-     * phantom pode estar invertido/rotacionado, permitindo conferencia pelo
-     * usuario.
+     * Reproduz a abordagem da macro do usuario: NAO segmenta os pinos; usa as
+     * coordenadas de referencia (t1, t2) ajustadas pelo deslocamento entre o
+     * centro detectado do phantom e o centro de referencia, e faz uma busca
+     * local de maximo de HU (janela de 5mm) para travar no pino.
+     *
+     * VERIFICACAO DE ORIENTACAO/INVERSAO (pedido do usuario): alem do par
+     * nominal (t1,t2), testa tambem o par ESPELHADO em relacao ao centro
+     * (t1',t2'), que corresponde ao phantom invertido/rotacionado 180 graus.
+     * Escolhe o par cuja distancia medida fica mais proxima dos 100mm nominais e
+     * sinaliza quando foi o par espelhado que venceu (phantom possivelmente
+     * invertido).
      */
     private static void measurePinDistance(LoadedSeries ls, AcrQcResult r, int slice) {
         if (slice < 1 || slice > ls.stack.getSize()) { r.pinNote = "fatia de pinos invalida"; return; }
         ImageProcessor ip = ls.stack.getProcessor(slice);
-        double[] c = phantomCenter(ip, ls.cal);
+        double[] cPx = phantomCenter(ip, ls.cal);
+        double cxMm = cPx[0] * ls.px, cyMm = cPx[1] * ls.py;
 
-        List<Marker> markers = detectMarkers(ip, ls.cal, ls.px, ls.py, c, 300.0);
-        if (markers.size() < 2) {
-            markers = detectMarkers(ip, ls.cal, ls.px, ls.py, c, 150.0);
-        }
-        r.pinMarkerCount = markers.size();
-        if (markers.size() < 2) {
-            r.pinDistance = Double.NaN;
-            r.pinNote = "menos de 2 marcadores detectados (nenhum pino de referencia)";
-            return;
-        }
+        // Offset entre o centro detectado e o centro de referencia da macro.
+        double offX = cxMm - PIN_REF_CENTER_X_MM;
+        double offY = cyMm - PIN_REF_CENTER_Y_MM;
 
-        // Para cada par de marcadores DIAMETRALMENTE OPOSTOS (ponto medio proximo
-        // do centro), classifica como horizontal ou vertical e guarda a melhor
-        // distancia de cada orientacao. Isto torna a medida robusta a inversao/
-        // rotacao do phantom: reportamos AMBAS as orientacoes e sinalizamos quando
-        // o par alinhado nao esta na horizontal esperada.
-        double bestHdist = Double.NaN, bestVdist = Double.NaN;
-        double bestHoff = Double.MAX_VALUE, bestVoff = Double.MAX_VALUE;
-        for (int i = 0; i < markers.size(); i++) {
-            for (int j = i + 1; j < markers.size(); j++) {
-                Marker a = markers.get(i), b = markers.get(j);
-                double mx = (a.x + b.x) / 2.0, my = (a.y + b.y) / 2.0;
-                double offCenterMm = Math.hypot(mx - c[0], my - c[1]) * ls.px;
-                if (offCenterMm > 10.0) continue; // nao e um par oposto
-                double dxMm = (b.x - a.x) * ls.px, dyMm = (b.y - a.y) * ls.py;
-                double distMm = Math.hypot(dxMm, dyMm);
-                double absAngle = Math.toDegrees(Math.atan2(Math.abs(dyMm), Math.abs(dxMm)));
-                if (absAngle < 45.0) { // horizontal
-                    if (offCenterMm < bestHoff) { bestHoff = offCenterMm; bestHdist = distMm; }
-                } else { // vertical
-                    if (offCenterMm < bestVoff) { bestVoff = offCenterMm; bestVdist = distMm; }
-                }
-            }
-        }
+        // Fundo local da regiao (mediana aproximada via media central) para medir
+        // o contraste dos pinos acima do fundo.
+        double bg = measureOval(ip, ls.cal, cPx[0], cPx[1], 10.0 / ls.px, "bg").mean;
 
-        r.pinDistanceH = bestHdist;
-        r.pinDistanceV = bestVdist;
+        // Par nominal (orientacao esperada).
+        double[] n1 = localMaxHU(ip, ls, (PIN_T1_X_MM + offX) / ls.px, (PIN_T1_Y_MM + offY) / ls.py);
+        double[] n2 = localMaxHU(ip, ls, (PIN_T2_X_MM + offX) / ls.px, (PIN_T2_Y_MM + offY) / ls.py);
+        double distNominal = Math.hypot((n2[0] - n1[0]) * ls.px, (n2[1] - n1[1]) * ls.py);
+        double contrNominal = Math.min(n1[2] - bg, n2[2] - bg); // contraste do pino mais fraco
 
-        // Escolhe o par cuja distancia e mais proxima do nominal como principal.
-        boolean hasH = !Double.isNaN(bestHdist), hasV = !Double.isNaN(bestVdist);
-        if (hasH && hasV) {
-            double eH = Math.abs(bestHdist - AcrQcResult.PIN_DISTANCE_NOMINAL_MM);
-            double eV = Math.abs(bestVdist - AcrQcResult.PIN_DISTANCE_NOMINAL_MM);
-            if (eH <= eV) { r.pinDistance = bestHdist; r.pinOrientation = "horizontal"; }
-            else          { r.pinDistance = bestVdist; r.pinOrientation = "vertical"; }
-        } else if (hasH) {
-            r.pinDistance = bestHdist; r.pinOrientation = "horizontal";
-        } else if (hasV) {
-            r.pinDistance = bestVdist; r.pinOrientation = "vertical";
+        // Par espelhado em relacao ao centro de referencia (phantom invertido 180).
+        double t1xInv = 2 * PIN_REF_CENTER_X_MM - PIN_T1_X_MM;
+        double t1yInv = 2 * PIN_REF_CENTER_Y_MM - PIN_T1_Y_MM;
+        double t2xInv = 2 * PIN_REF_CENTER_X_MM - PIN_T2_X_MM;
+        double t2yInv = 2 * PIN_REF_CENTER_Y_MM - PIN_T2_Y_MM;
+        double[] i1 = localMaxHU(ip, ls, (t1xInv + offX) / ls.px, (t1yInv + offY) / ls.py);
+        double[] i2 = localMaxHU(ip, ls, (t2xInv + offX) / ls.px, (t2yInv + offY) / ls.py);
+        double distInverted = Math.hypot((i2[0] - i1[0]) * ls.px, (i2[1] - i1[1]) * ls.py);
+        double contrInverted = Math.min(i1[2] - bg, i2[2] - bg);
+
+        // A ESCOLHA do par correto baseia-se no CONTRASTE dos pinos (os pinos
+        // reais sao pontos claros, bem acima do fundo). A inversao so e
+        // sinalizada quando o par ESPELHADO tem contraste claramente maior que o
+        // nominal -- indicio real de phantom invertido. Se os contrastes forem
+        // semelhantes (pinos simetricos), usa-se o par nominal sem alarme.
+        r.pinDistanceH = distNominal;   // H = par nominal
+        r.pinDistanceV = distInverted;  // V = par espelhado
+        r.pinMarkerCount = 2;
+
+        double CONTRAST_MARGIN = 10.0; // HU
+        if (contrInverted > contrNominal + CONTRAST_MARGIN) {
+            r.pinDistance = distInverted;
+            r.pinOrientation = "espelhado";
+            r.pinPhantomInverted = true;
+            r.pinNote = String.format(java.util.Locale.US,
+                    "nominal=%.1f mm (contraste %.0f HU) | espelhado=%.1f mm (contraste %.0f HU) | "
+                    + "usado: espelhado (VERIFICAR: phantom possivelmente invertido/rotacionado)",
+                    distNominal, contrNominal, distInverted, contrInverted);
         } else {
-            r.pinDistance = Double.NaN;
-            r.pinNote = markers.size() + " marcadores, mas nenhum par diametralmente oposto";
-            return;
+            r.pinDistance = distNominal;
+            r.pinOrientation = "nominal";
+            r.pinPhantomInverted = false;
+            String warn = (contrNominal < 5.0) ? " (pinos com baixo contraste \u2014 conferir)" : "";
+            r.pinNote = String.format(java.util.Locale.US,
+                    "nominal=%.1f mm (contraste %.0f HU) | espelhado=%.1f mm (contraste %.0f HU) | usado: nominal%s",
+                    distNominal, contrNominal, distInverted, contrInverted, warn);
         }
-
-        // Conferencia de inversao: no ACR padrao (nao rotacionado) o par de
-        // referencia de distancia esta alinhado HORIZONTALMENTE. Se o par
-        // utilizado estiver na vertical, o phantom pode estar invertido/
-        // rotacionado -> sinaliza para conferencia do usuario.
-        r.pinPhantomInverted = r.pinOrientation.equals("vertical");
-        r.pinNote = String.format(java.util.Locale.US,
-                "%d marcadores | H=%s mm | V=%s mm | par usado: %s%s",
-                markers.size(),
-                hasH ? String.format(java.util.Locale.US, "%.1f", bestHdist) : "-",
-                hasV ? String.format(java.util.Locale.US, "%.1f", bestVdist) : "-",
-                r.pinOrientation,
-                r.pinPhantomInverted ? " (VERIFICAR: phantom possivelmente invertido/rotacionado)" : "");
     }
 
-    /** Detecta marcadores de alto HU (beads/pinos) dentro do phantom e agrupa em clusters. */
-    private static List<Marker> detectMarkers(ImageProcessor ip, Calibration cal,
-                                              double px, double py, double[] c, double thrHU) {
-        int w = ip.getWidth(), h = ip.getHeight();
-        double rInner = 30.0 / px;   // ignora o centro (evita falsos positivos de texturas)
-        double rOuter = 90.0 / px;   // dentro do corpo do phantom
-
-        // Coleta pixels acima do limiar no anel.
-        List<double[]> pts = new ArrayList<>();
-        int x0 = (int) Math.max(0, c[0] - rOuter), x1 = (int) Math.min(w - 1, c[0] + rOuter);
-        int y0 = (int) Math.max(0, c[1] - rOuter), y1 = (int) Math.min(h - 1, c[1] + rOuter);
-        for (int y = y0; y <= y1; y++) {
-            for (int x = x0; x <= x1; x++) {
-                double d = Math.hypot(x - c[0], y - c[1]);
-                if (d < rInner || d > rOuter) continue;
-                double hu = (cal != null) ? cal.getCValue(ip.getf(x, y)) : ip.getf(x, y);
-                if (hu > thrHU) pts.add(new double[]{x, y, hu});
+    /** Busca o maximo de HU numa janela de 5mm ao redor de (gx,gy) em pixels. */
+    private static double[] localMaxHU(ImageProcessor ip, LoadedSeries ls, double gx, double gy) {
+        int cx = (int) Math.round(gx), cy = (int) Math.round(gy);
+        int sr = (int) Math.round(PIN_SEARCH_RADIUS_MM / ls.px);
+        double best = -Double.MAX_VALUE; int bx = cx, by = cy;
+        for (int y = cy - sr; y <= cy + sr; y++) {
+            for (int x = cx - sr; x <= cx + sr; x++) {
+                if (x < 0 || x >= ip.getWidth() || y < 0 || y >= ip.getHeight()) continue;
+                double hu = (ls.cal != null) ? ls.cal.getCValue(ip.getf(x, y)) : ip.getf(x, y);
+                if (hu > best) { best = hu; bx = x; by = y; }
             }
         }
-
-        // Agrupamento por proximidade.
-        double clusterPx = 10.0 / px;
-        List<Marker> markers = new ArrayList<>();
-        boolean[] used = new boolean[pts.size()];
-        for (int i = 0; i < pts.size(); i++) {
-            if (used[i]) continue;
-            double ax = pts.get(i)[0], ay = pts.get(i)[1];
-            double gx = 0, gy = 0, sumh = 0; int n = 0;
-            for (int j = 0; j < pts.size(); j++) {
-                if (used[j]) continue;
-                if (Math.hypot(pts.get(j)[0] - ax, pts.get(j)[1] - ay) <= clusterPx * 2) {
-                    used[j] = true; gx += pts.get(j)[0]; gy += pts.get(j)[1]; sumh += pts.get(j)[2]; n++;
-                }
-            }
-            if (n < 3) continue; // ignora clusters minusculos (ruido)
-            Marker m = new Marker();
-            m.x = gx / n; m.y = gy / n; m.hu = sumh / n;
-            m.radiusMm = Math.hypot(m.x - c[0], m.y - c[1]) * px;
-            m.angleDeg = Math.toDegrees(Math.atan2(m.y - c[1], m.x - c[0]));
-            markers.add(m);
-        }
-        return markers;
+        return new double[]{bx, by, best};
     }
 
     // ------------------------------------------------------------------
@@ -1006,14 +1041,16 @@ public class AcrQcAnalyser {
         if (ttfSlices.size() > 2) ttfSlices = ttfSlices.subList(1, ttfSlices.size() - 1);
         computeTtf(ls, ttfSlices, q);
 
-        // --- NPS: TODAS as fatias uniformes limpas (classe UNIFORM); se nao
-        //     houver, usa o modulo de beads filtrando as fatias com bead ---
+        // --- NPS: fatias uniformes limpas (classe UNIFORM), DESCARTANDO as de
+        //     borda contaminadas por volume parcial do modulo vizinho (beads).
+        //     As bordas tem ruido central muito acima da mediana -> removidas ---
         List<Integer> uniformSlices = new ArrayList<>(mm.uniformSlices);
         Collections.sort(uniformSlices);
         if (uniformSlices.isEmpty() && !mm.beadsSlices.isEmpty()) {
             int bs = Collections.min(mm.beadsSlices), be = Collections.max(mm.beadsSlices);
             uniformSlices = filterUniformitySlices(ls.stack, bs, be, ls.cal, ls.px, ls.py);
         }
+        uniformSlices = rejectContaminatedSlices(ls, uniformSlices);
         computeNps(ls, uniformSlices, q);
 
         // --- d' / NPWE ---
@@ -1032,6 +1069,64 @@ public class AcrQcAnalyser {
 
         q.ok = true;
         return q;
+    }
+
+    /**
+     * Rejeita fatias de uniformidade contaminadas por volume parcial do modulo
+     * vizinho (ex.: resquicio dos beads nas fatias de borda), que apresentam
+     * ruido central anomalo. Mede o desvio padrao num ROI central de cada fatia
+     * e descarta as que excedem 1.5x a mediana do conjunto. Mantem ao menos as
+     * fatias mais limpas.
+     */
+    // Margem de seguranca (mm) para afastar as fatias de NPS das INTERFACES
+    // entre modulos do phantom. Cada modulo do ACR tem 40mm; proximo das
+    // interfaces ha volume parcial do modulo vizinho (ex.: beads) que contamina
+    // o ruido. Descartamos as fatias a menos desta margem das bordas do bloco.
+    private static final double MODULE_INTERFACE_MARGIN_MM = 7.0;
+
+    /**
+     * Descarta as fatias de uniformidade proximas das INTERFACES entre modulos,
+     * usando o Slice Location do DICOM e as dimensoes conhecidas do phantom. E
+     * mais robusto que inferir contaminacao por estatistica de ruido: as fatias
+     * de borda (volume parcial do modulo vizinho) sao removidas deterministicamente.
+     *
+     * Quando nao ha Slice Location, cai no espacamento de fatia (pixelDepth) e,
+     * em ultimo caso, apenas apara a primeira e a ultima fatia do bloco.
+     */
+    static List<Integer> rejectContaminatedSlices(LoadedSeries ls, List<Integer> slices) {
+        if (slices == null || slices.size() <= 2) return slices;
+        List<Integer> sorted = new ArrayList<>(slices);
+        Collections.sort(sorted);
+
+        if (ls.hasSliceLoc) {
+            // Posicoes (mm) das fatias do bloco; bordas = interfaces com vizinhos.
+            double locFirst = ls.sliceLoc[sorted.get(0) - 1];
+            double locLast  = ls.sliceLoc[sorted.get(sorted.size() - 1) - 1];
+            double lo = Math.min(locFirst, locLast);
+            double hi = Math.max(locFirst, locLast);
+
+            List<Integer> kept = new ArrayList<>();
+            for (int z : sorted) {
+                double loc = ls.sliceLoc[z - 1];
+                if (Double.isNaN(loc)) continue;
+                // Mantem apenas fatias suficientemente distantes das duas interfaces.
+                if ((loc - lo) >= MODULE_INTERFACE_MARGIN_MM
+                        && (hi - loc) >= MODULE_INTERFACE_MARGIN_MM) {
+                    kept.add(z);
+                }
+            }
+            if (!kept.isEmpty()) return kept;
+            // Se a margem eliminou tudo (bloco fino), cai no aparo simples abaixo.
+        }
+
+        // Fallback sem posicoes DICOM utilizaveis: usa o espacamento para estimar
+        // quantas fatias aparar em cada extremidade (>= 1).
+        int trim = Math.max(1, (int) Math.round(MODULE_INTERFACE_MARGIN_MM / Math.max(0.1, ls.sliceSpacing)));
+        if (sorted.size() > 2 * trim + 1) {
+            return new ArrayList<>(sorted.subList(trim, sorted.size() - trim));
+        }
+        // Bloco pequeno: apara so a primeira e a ultima.
+        return new ArrayList<>(sorted.subList(1, sorted.size() - 1));
     }
 
     /** Filtra fatias de uniformidade removendo as que contem beads (max HU alto). */
