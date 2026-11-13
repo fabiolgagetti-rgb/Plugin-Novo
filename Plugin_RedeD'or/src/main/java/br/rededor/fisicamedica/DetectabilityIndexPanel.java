@@ -912,4 +912,45 @@ public class DetectabilityIndexPanel {
         return imp;
     }
 
+    // ------------------------------------------------------------------
+    // API de integracao com a aba "CQ ACR"
+    // ------------------------------------------------------------------
+
+    /** Parametros de visualizacao pre-configurados no eye filter (viewDist, displaySize, fov). */
+    public static double[] getEyeFilterParams() {
+        double vDist = parseOr(viewDistanceField, 500.0);
+        double dSize = parseOr(displaySizeField, 305.0);
+        double fov   = parseOr(fovField, 250.0);
+        return new double[]{vDist, dSize, fov};
+    }
+
+    private static double parseOr(JTextField f, double def) {
+        try { return Double.parseDouble(f.getText().trim()); } catch (Exception e) { return def; }
+    }
+
+    /**
+     * Publica no painel NPWE um resultado de d'/AUC calculado externamente
+     * (ex.: pelo fluxo automatico da aba "CQ ACR"), atualizando tambem os campos
+     * de parametros da tarefa usados no calculo.
+     */
+    public static void publishExternalResult(double dPrime, double auc,
+                                             double taskRadius, double taskContrast,
+                                             double[] ttfFreq, double[] ttfData,
+                                             double[] npsFreq, double[] npsData, double[][] nps2D) {
+        if (dPrimeResultField != null) dPrimeResultField.setText(DF.format(dPrime));
+        if (AucResultField != null)    AucResultField.setText(DF.format(auc));
+        if (taskRadiusField != null)   taskRadiusField.setText(String.valueOf(taskRadius));
+        if (taskContrastField != null) taskContrastField.setText(String.valueOf(taskContrast));
+
+        lastTtfFreq = ttfFreq;
+        lastTtfData = ttfData;
+        lastNpsFreq = npsFreq;
+        lastNpsData = npsData;
+        lastNps2D = nps2D;
+        lastTaskContrast = taskContrast;
+        lastTaskRadius = taskRadius;
+
+        if (btnShowImages != null) btnShowImages.setEnabled(ttfData != null && nps2D != null);
+        if (btnGeneratePhantom != null) btnGeneratePhantom.setEnabled(ttfData != null && nps2D != null);
+    }
 }

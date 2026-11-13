@@ -532,4 +532,26 @@ public class NPSpanel {
     public static double[] getLastRadialNPS() {
         return lastRadialNPS;
     }
+
+    /**
+     * Publica no painel de NPS um resultado calculado externamente (ex.: pelo
+     * fluxo automatico da aba "CQ ACR"), atualizando o grafico, os campos de
+     * resultado e os getters usados pelo painel NPWE. Usado para manter os
+     * resultados visiveis em seus respectivos painels.
+     */
+    public static void publishExternalResult(double[] radialFreq, double[] radialNPS, double[][] nps2D,
+                                             double variance, double integratedNPS,
+                                             double peakFreq, double meanFreq) {
+        lastRadialFreq = radialFreq;
+        lastRadialNPS = radialNPS;
+        lastNPS2D = nps2D;
+
+        if (radialFreq != null && radialNPS != null) {
+            NpsGraphManager.updateChart(radialFreq, radialNPS);
+        }
+        if (varianceField != null)   varianceField.setText(DF.format(variance));
+        if (integratedField != null) integratedField.setText(DF.format(integratedNPS));
+        if (peakFreqField != null)   peakFreqField.setText(DF.format(peakFreq));
+        if (meanFreqField != null)   meanFreqField.setText(DF.format(meanFreq));
+    }
 }
