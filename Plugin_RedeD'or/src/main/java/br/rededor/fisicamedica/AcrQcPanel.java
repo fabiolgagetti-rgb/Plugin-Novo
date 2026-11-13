@@ -289,7 +289,11 @@ public class AcrQcPanel {
             sb.append("=== ESPESSURA DE CORTE ===\n");
             sb.append("Nominal (DICOM)   : ").append(d(r.sliceThicknessDicom, "mm")).append("\n");
             sb.append("Medida (superior) : ").append(d(r.sliceThicknessTop, "mm")).append("\n");
-            sb.append("Medida (inferior) : ").append(d(r.sliceThicknessBottom, "mm")).append("\n\n");
+            sb.append("Medida (inferior) : ").append(d(r.sliceThicknessBottom, "mm")).append("\n");
+            if (r.sliceThicknessNote != null && !r.sliceThicknessNote.isEmpty()) {
+                sb.append("  (").append(r.sliceThicknessNote).append(")\n");
+            }
+            sb.append("\n");
 
             sb.append("=== EXATIDAO DO NUMERO DE CT (fatia ").append(r.ctSlice).append(") ===\n");
             sb.append("Agua          : ").append(m(r.water)).append("\n");
@@ -313,10 +317,18 @@ public class AcrQcPanel {
             sb.append("Fundo         : ").append(m(r.lcBackground)).append("\n");
             sb.append("CNR           : ").append(d(r.cnr, "")).append("\n\n");
 
-            sb.append("=== EXATIDAO DE DISTANCIA (pinos de referencia) ===\n");
-            sb.append("Distancia medida : ").append(d(r.pinDistance, "mm"));
-            sb.append(String.format(java.util.Locale.US, "  (nominal %.0f mm)%n%n",
-                    AcrQcAnalyser.AcrQcResult.PIN_DISTANCE_NOMINAL_MM));
+            sb.append("=== EXATIDAO DE DISTANCIA (pinos de referencia, fatia ")
+              .append(r.pinSlice).append(") ===\n");
+            sb.append("Distancia medida : ").append(d(r.pinDistance, "mm"))
+              .append("  (par ").append(r.pinOrientation).append(")\n");
+            sb.append("  Par horizontal : ").append(d(r.pinDistanceH, "mm")).append("\n");
+            sb.append("  Par vertical   : ").append(d(r.pinDistanceV, "mm")).append("\n");
+            sb.append("  Marcadores     : ").append(r.pinMarkerCount).append("\n");
+            if (r.pinPhantomInverted) {
+                sb.append("  ** ATENCAO: phantom possivelmente invertido/rotacionado ")
+                  .append("(par alinhado na vertical em vez da horizontal) \u2014 verificar **\n");
+            }
+            sb.append("\n");
         }
 
         sb.append("=== QUALIDADE DE IMAGEM (detalhes nos paineis TTF / NPS / NPWE) ===\n");
