@@ -68,3 +68,15 @@ projeto, reconciliar divergências de nomes de método que existem entre os repo
 ## Imagens de validação
 - Usar a série **CRANIO S_C** do phantom ACR para validação.
 - NÃO usar `Detectabilidade/PORTAL 0.625mm-1.tif`.
+
+## Abertura automatica na inicializacao do ImageJ
+- `AutoStartService` (um `@Plugin(type = Service.class)`) escuta o
+  `UIShownEvent` do SciJava e executa `DetectabilidadePlugin` assim que a
+  interface do ImageJ aparece. Abre apenas uma vez e so quando ha GUI (em
+  headless o evento nao e disparado).
+- Para isso funcionar, o indice de anotacoes
+  `META-INF/json/org.scijava.plugin.Plugin` precisa ser gerado no build. O
+  `maven-compiler-plugin` foi configurado com `<annotationProcessors>` incluindo
+  `org.scijava.annotations.AnnotationProcessor` — sem isso, com `release 8` +
+  JDK 17, o Maven nao roda o processor e o indice (e o autostart) nao e gerado.
+- Para desabilitar a abertura automatica, remover `AutoStartService.java`.

@@ -164,6 +164,16 @@
             <version>3.11.0</version>
             <configuration>
                 <release>8</release>
+                <!--
+                    Habilita explicitamente o annotation processing do SciJava,
+                    que gera META-INF/json/org.scijava.plugin.Plugin (indice de
+                    @Plugin). Esse indice e necessario para que Services (como o
+                    AutoStartService, que abre o plugin na inicializacao) sejam
+                    instanciados no boot do ImageJ.
+                -->
+                <annotationProcessors>
+                    <annotationProcessor>org.scijava.annotations.AnnotationProcessor</annotationProcessor>
+                </annotationProcessors>
             </configuration>
         </plugin>
 
