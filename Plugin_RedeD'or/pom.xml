@@ -121,6 +121,12 @@
             <artifactId>commons-math3</artifactId>
             <version>3.6.1</version>
         </dependency>
+        <!-- Savitzky-Golay smoothing, usado pelo painel de Modulacao de Corrente (TMC) -->
+        <dependency>
+            <groupId>io.vacco.savitzky-golay</groupId>
+            <artifactId>savitzky-golay</artifactId>
+            <version>1.0.1</version>
+        </dependency>
          <dependency>
             <groupId>commons-io</groupId>
             <artifactId>commons-io</artifactId>
@@ -159,6 +165,33 @@
             <configuration>
                 <release>8</release>
             </configuration>
+        </plugin>
+
+        <!--
+            O pom-scijava impoe a regra enforceBytecodeVersion (alvo JDK 8). A
+            biblioteca savitzky-golay 1.0.1 (usada pelo painel de Modulacao de
+            Corrente) traz SgFilter.class compilado para JDK 11. Ignoramos essa
+            classe especifica na regra para permitir o uso da dependencia sem
+            relaxar a verificacao para o restante do projeto.
+        -->
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-enforcer-plugin</artifactId>
+            <executions>
+                <execution>
+                    <id>enforce-rules</id>
+                    <configuration>
+                        <rules>
+                            <enforceBytecodeVersion>
+                                <maxJdkVersion>1.8</maxJdkVersion>
+                                <ignoreClasses>
+                                    <ignoreClass>io.vacco.savitzkygolay.*</ignoreClass>
+                                </ignoreClasses>
+                            </enforceBytecodeVersion>
+                        </rules>
+                    </configuration>
+                </execution>
+            </executions>
         </plugin>
 
         <plugin>

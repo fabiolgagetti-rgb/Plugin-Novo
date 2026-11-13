@@ -24,11 +24,13 @@ public class TopPanel {
         JPanel npsPanel = NPSpanel.create();
         JPanel dPrimePanel = DetectabilityIndexPanel.create();
         JPanel acrQcPanel = AcrQcPanel.create();
+        JPanel tmcPanel = TmcPanel.create();
 
         tabbedPane.addTab("CQ ACR", acrQcPanel);
         tabbedPane.addTab("TTF", mtfPanel);
         tabbedPane.addTab("NPS", npsPanel);
         tabbedPane.addTab("NPWE Model Observer", dPrimePanel);
+        tabbedPane.addTab("Modulacao de Corrente", tmcPanel);
 
         rootPanel.add(tabbedPane, BorderLayout.CENTER);
         
