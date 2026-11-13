@@ -3,8 +3,10 @@ package br.rededor.fisicamedica;
 import java.util.ArrayList;
 import java.util.List;
 
+/** Averages a set of equal-length ESF profiles element-wise (ignoring nulls). */
 public class CurveAverage {
 
+	/** @return the element-wise mean of the ESF curves, or null if none are valid. */
 	public static double[] averageEsfs(List<double[]> esfCurves) {
 	    if (esfCurves == null || esfCurves.isEmpty()) return null;
 

@@ -11,6 +11,7 @@ import ij.gui.PolygonRoi;
 import ij.gui.Roi;
 import ij.gui.Wand;
 import ij.measure.Calibration;
+import ij.plugin.RoiEnlarger;
 import ij.plugin.filter.EDM;
 import ij.plugin.frame.RoiManager;
 import ij.process.ByteProcessor;
@@ -20,20 +21,60 @@ import ij.process.FloodFiller;
 import ij.process.ImageProcessor;
 import ij.process.ImageStatistics;
 
+/**
+ * Edge detection and sub-pixel boundary extraction for the TTF pipeline.
+ *
+ * Given an image stack and a ROI (or automatic record placement), it locates each
+ * object (insert) and extracts a clean sub-pixel boundary by: Otsu thresholding +
+ * wand outline for a coarse contour, the partial-area edge detector (PAE) for the
+ * sub-pixel edge, then hole-free wand anchoring (buildPolygonFilled) to produce an
+ * ordered polygon with a per-point analytic normal. It also estimates each
+ * structure's contrast, background noise and CNR. The resulting DetectorResult is
+ * consumed by TtfCalc to measure the TTF.
+ */
 public class Segmenter {
+
+	// --- Hole-free wand-anchoring tunables (buildPolygonFilled) ---
+	// Defaults validated on SOFT/LUNG virtual phantoms and a real spine image.
+	/** Max distance (px) a densified wand point may snap to a PAE edge. */
+	private static final double FILL_TOL_PX   = 6.0;
+	/** Spike-guard threshold (px): perpendicular deviation from the local edge
+	 *  trajectory above which a snapped point is rejected as spurious. */
+	private static final double FILL_SPIKE_PX = 2.5;
+	/** Half-window (points) of the final moving-average contour smoothing. */
+	private static final int    FILL_SMOOTH   = 1;
 
 	public static class DetectorResult {
 	    List<Double> HU = new ArrayList<>();
 	    List<Double> StdDev = new ArrayList<>();
 	    List<Double> Threshold = new ArrayList<>();
 	    List<Double> radius = new ArrayList<>();
-	    List<List<Roi>> rois = new ArrayList<>(); 
-	    List<Roi> roi = new ArrayList<>();   
+	    List<List<Roi>> rois = new ArrayList<>();
+	    List<Roi> roi = new ArrayList<>();
 	    List<Point> Pos = new ArrayList<>();
-	    
-	    List<List<Double>> modeContrast = new ArrayList<>(); 
+
+	    List<List<Double>> modeContrast = new ArrayList<>();
 	    List<List<Double>> meanI0 = new ArrayList<>();
 	    List<List<Double>> meanI1 = new ArrayList<>();
+
+	    // Per-structure contrast / noise / CNR, aligned with 'roi' (one entry per
+	    // accepted structure). Registered at detection time for reporting in the UI.
+	    //   contrast : full edge step height (HU-calibrated units of the image)
+	    //   noise    : std-dev of the background band just outside the shape
+	    //   cnr      : contrast / noise
+	    public List<Double> contrast = new ArrayList<>();
+	    public List<Double> noise = new ArrayList<>();
+	    public List<Double> cnr = new ArrayList<>();
+
+	    // Option A (PAE edge normals), unit normals [nPoints][2] aligned 1:1 with the
+	    // final ROI polygon points, taken directly from the partial-area detector.
+	    // Lets the ESF step use each point's own analytic normal instead of a
+	    // neighbour-fit, so dropped points ("holes") no longer corrupt neighbouring
+	    // normals. May be null/empty when unavailable.
+	    //   edgeNormalsPerRoi : per-insert   (aligned with 'roi'),  set in processRecord
+	    //   edgeNormals       : per-insert, per-slice (aligned with 'rois'), set in edgeFinder
+	    List<double[][]> edgeNormalsPerRoi = new ArrayList<>();
+	    List<List<double[][]>> edgeNormals = new ArrayList<>();
 	}
 
     private static class OtsuResult {
@@ -41,58 +82,143 @@ public class Segmenter {
         double max_bcv;
     }
 
+    // ------------------------------------------------------------------
+    // Adaptive parameter selection for the subpixel edge detector.
+    //
+    // Replaces two previously hard-coded choices in processRecord:
+    //   (1) a fixed Gaussian pre-blur of sigma = 1, and
+    //   (2) gradThreshold = 0.5 * |mode - thresholdForEdge|.
+    //
+    // (1) The optimal pre-blur depends on the contrast-to-noise ratio (CNR):
+    //     clean/soft-kernel data wants little blur (localization), noisy
+    //     bone/lung-kernel data wants more (denoising). sigma is fit to the
+    //     measured localization/denoising crossover:
+    //         sigma = clamp(2.0 - 0.75*log10(CNR), 0.4, 1.6)
+    //     (CNR 100 -> 0.5, 20 -> 1.0, 10 -> 1.25, 5 -> 1.5).
+    //
+    // (2) The old threshold mixed intensity units with a gradient-magnitude
+    //     comparison and ignored noise. The detector thresholds the magnitude
+    //     of a central difference of the 3x3-smoothed image, so the threshold
+    //     is set from the wand-ROI noise std-dev: a central difference of two
+    //     independent samples has std ~0.7*noise, and we sit ~3.5x above that
+    //     floor (with a small contrast-relative minimum for the clean case).
+    // ------------------------------------------------------------------
+
+    private static double blurSigmaForCNR(double cnr) {
+        if (!(cnr > 0) || Double.isInfinite(cnr)) return 0.4;
+        double s = 2.0 - 0.75 * Math.log10(cnr);
+        return Math.max(0.4, Math.min(1.6, s));
+    }
+
+    /**
+     * Estimate image noise from a thin band JUST OUTSIDE the detected shape.
+     *
+     * Builds band = enlarge(shape, +bandPx) minus the shape interior, and returns
+     * the std-dev of the ORIGINAL image there. This region is background (truly
+     * homogeneous), so it reflects genuine image noise and is immune to internal
+     * structures inside the object (which would otherwise inflate an interior-based
+     * std and over-blur the edge). Falls back to the shrunk-interior std if the
+     * outside band is empty or touches the image border badly.
+     */
+    private static double noiseOutsideShape(ImageProcessor origIp, Roi shape) {
+        try {
+            // Leave a GAP beyond the shape so the band clears the (blurred) edge
+            // transition entirely, then take a band of width 'bandPx' past the gap.
+            int gapPx = 6;      // clears the edge + its blur
+            int bandPx = 8;     // thickness of the pure-background sampling band
+            Roi inner = RoiEnlarger.enlarge(shape, gapPx);
+            Roi outer = RoiEnlarger.enlarge(shape, gapPx + bandPx);
+            ByteProcessor bandMask = new ByteProcessor(origIp.getWidth(), origIp.getHeight());
+            bandMask.setColor(255);
+            bandMask.fill(outer);
+            bandMask.setColor(0);
+            bandMask.fill(inner);                 // carve out shape+gap -> only the far band remains
+
+            double sum = 0, sum2 = 0; long n = 0;
+            for (int y = 0; y < origIp.getHeight(); y++) {
+                for (int x = 0; x < origIp.getWidth(); x++) {
+                    if (bandMask.get(x, y) != 0) {
+                        double v = origIp.getf(x, y);
+                        sum += v; sum2 += v * v; n++;
+                    }
+                }
+            }
+            if (n >= 20) {
+                double mean = sum / n;
+                double var = sum2 / n - mean * mean;
+                if (var > 0) return Math.sqrt(var);
+            }
+        } catch (Exception ignore) {
+            // fall through to interior fallback
+        }
+        // Fallback: previous behavior (shrunk interior std) if the outside band failed.
+        Roi noiseRoi = RoiEnlarger.enlarge(shape, -5);
+        origIp.setRoi(noiseRoi);
+        double sd = origIp.getStatistics().stdDev;
+        origIp.resetRoi();
+        return sd;
+    }
+
     public static DetectorResult edgeFinder(ImageStack stack, Calibration cal, Roi userRoi, boolean isAuto, boolean avgSlices) {
-        ImageProcessor media = calcularMedia(stack);
+        ImageProcessor avgImage = averageStack(stack);
         DetectorResult dR;
-        
+
         if (isAuto) {
-            double recordSizePx = media.getWidth() * 0.1;
-            double overlap = 0.5; 
-            dR = autoDetect(media, cal, recordSizePx, overlap);
+            double recordSizePx = avgImage.getWidth() * 0.1;
+            double overlap = 0.5;
+            dR = autoDetect(avgImage, cal, recordSizePx, overlap);
         } else {
             if (userRoi == null) {
                 throw new IllegalArgumentException("Draw a ROI in the image or use the automatic detection method");
             }
-            dR = roiDetect(media, media, cal, userRoi);
+            dR = roiDetect(avgImage, avgImage, cal, userRoi);
         }
 
         int nSlices = stack.size();
         dR.rois = new ArrayList<>();
 
+        dR.edgeNormals = new ArrayList<>();
+
         for (int i = 0; i < dR.roi.size(); i++) {
             List<Roi> sliceRois = new ArrayList<>();
+            List<double[][]> sliceNormals = new ArrayList<>();
             Roi avgRoi = dR.roi.get(i);
+            double[][] avgNormals = (i < dR.edgeNormalsPerRoi.size()) ? dR.edgeNormalsPerRoi.get(i) : null;
             Rectangle bounds = dR.roi.get(i).getBounds();
 
             for (int z = 1; z <= nSlices; z++) {
                 if (avgSlices) {
                     sliceRois.add(avgRoi);
+                    sliceNormals.add(avgNormals);
                 } else {
                     ImageProcessor sliceIp = stack.getProcessor(z);
                     ImageProcessor blurredSlice = sliceIp.duplicate();
                     blurredSlice.blurGaussian(1);
 
                     DetectorResult tempResult = new DetectorResult();
-                    
+
                     int padding = (int) Math.max(10, (bounds.getWidth()+bounds.getHeight())*0.1);
                     int rx = Math.max(0, bounds.x - padding);
                     int ry = Math.max(0, bounds.y - padding);
                     int rw = Math.min(sliceIp.getWidth() - rx, bounds.width + 2 * padding);
                     int rh = Math.min(sliceIp.getHeight() - ry, bounds.height + 2 * padding);
                     Roi sliceRoi = new Roi(rx, ry, rw, rh);
-                    
+
                     blurredSlice.setRoi(userRoi);
                     ImageStatistics roiStats = blurredSlice.getStatistics();
                     double roiMode = (roiStats.histMin + roiStats.mode * roiStats.binSize);
-                        
+
                     processRecord(blurredSlice, sliceIp, cal, sliceRoi, tempResult, null, roiMode);
 
                     if (!tempResult.roi.isEmpty()) {
-                        sliceRois.add(tempResult.roi.get(0)); 
+                        sliceRois.add(tempResult.roi.get(0));
+                        sliceNormals.add(tempResult.edgeNormalsPerRoi.isEmpty()
+                                ? null : tempResult.edgeNormalsPerRoi.get(0));
                     }
                 }
             }
             dR.rois.add(sliceRois);
+            dR.edgeNormals.add(sliceNormals);
         }
         return dR;
     }
@@ -102,20 +228,20 @@ public class Segmenter {
 
         ImageProcessor blurredIp = origIp.duplicate();
         blurredIp.blurGaussian(1);
-        
+
         PolygonRoi phantomRoi = segmenter(origIp, cal, -200, 5000, 0.2, false, 0, 20);
-        
+
         blurredIp.setRoi(phantomRoi);
         ImageStatistics phantomStats = blurredIp.getStatistics();
         double mode = (phantomStats.histMin + phantomStats.mode * phantomStats.binSize);
-        
+
         ByteProcessor mask = new ByteProcessor(blurredIp.getWidth(), blurredIp.getHeight());
         mask.setColor(0);
         mask.fill();
 
         Rectangle searchArea;
-     
-        
+
+
         if (phantomRoi != null) {
             searchArea = phantomRoi.getBounds();
         } else {
@@ -136,12 +262,12 @@ public class Segmenter {
                     boolean topRight = phantomRoi.containsPoint(x + recordSizePx, y);
                     boolean bottomLeft = phantomRoi.containsPoint(x, y + recordSizePx);
                     boolean bottomRight = phantomRoi.containsPoint(x + recordSizePx, y + recordSizePx);
-                    
+
                     if (!topLeft || !topRight || !bottomLeft || !bottomRight) {
                         continue;
                     }
                 }
-                if (containsObject(mask, x, y, recordSizePx)) continue; 
+                if (containsObject(mask, x, y, recordSizePx)) continue;
 
                 Roi recordBounds = new Roi(x, y, (int)recordSizePx, (int)recordSizePx);
                 processRecord(blurredIp, origIp, cal, recordBounds, dR, mask, mode);
@@ -150,10 +276,10 @@ public class Segmenter {
         return dR;
     }
 
-    private static DetectorResult roiDetect(ImageProcessor ipOrig, ImageProcessor media, Calibration cal, Roi userRoi) {
+    private static DetectorResult roiDetect(ImageProcessor ipOrig, ImageProcessor avgImage, Calibration cal, Roi userRoi) {
         DetectorResult result = new DetectorResult();
 
-        ImageProcessor blurredIp = media.duplicate();
+        ImageProcessor blurredIp = avgImage.duplicate();
         blurredIp.blurGaussian(1);
 
         blurredIp.setRoi(userRoi);
@@ -161,11 +287,11 @@ public class Segmenter {
         double roiMode = (roiStats.histMin + roiStats.mode * roiStats.binSize);
         blurredIp.resetRoi();
         processRecord(blurredIp, ipOrig, cal, userRoi, result, null, roiMode);
-        
+
         return result;
     }
 
-    private static void processRecord(ImageProcessor blurredIp, ImageProcessor origIp, Calibration cal, 
+    private static void processRecord(ImageProcessor blurredIp, ImageProcessor origIp, Calibration cal,
                                                Roi recordBounds, DetectorResult dR, ByteProcessor processedMask, double mode) {
         int imgWidth = blurredIp.getWidth();
         int imgHeight = blurredIp.getHeight();
@@ -181,30 +307,31 @@ public class Segmenter {
         double thresholdForEdge = (stats.histMin + temp * stats.binSize + stats.binSize / 2.0);
 
         if (bcv < 3000) {
-            return; 
+            EdgeDiagnostics.record(EdgeDiagnostics.Reason.BCV_GATE);
+            return;
         }
 
         double minHU, maxHU;
         if (thresholdForEdge >= mode) {
-            minHU = thresholdForEdge; maxHU = Double.MAX_VALUE; 
-        } else { 
-            minHU = -Double.MAX_VALUE; maxHU = thresholdForEdge; 
+            minHU = thresholdForEdge; maxHU = Double.MAX_VALUE;
+        } else {
+            minHU = -Double.MAX_VALUE; maxHU = thresholdForEdge;
         }
 
         Wand wand = new Wand(blurredIp);
         boolean found = false;
-        
+
         int w = window.getWidth();
         int h = window.getHeight();
         int midX = w / 2;
         int midY = h / 2;
 
         for (int stepX = 0; stepX < w && !found; stepX++) {
-            int i = (midX + stepX) % w; 
+            int i = (midX + stepX) % w;
             for (int stepY = 0; stepY < h && !found; stepY++) {
-                int j = (midY + stepY) % h; 
+                int j = (midY + stepY) % h;
                 double val = window.getValue(i, j);
-                
+
                 if (val > minHU && val < maxHU) {
                     int gx = (int) (recordBounds.getXBase() + i);
                     int gy = (int) (recordBounds.getYBase() + j);
@@ -216,9 +343,10 @@ public class Segmenter {
             }
         }
         if (!found) {
+            EdgeDiagnostics.record(EdgeDiagnostics.Reason.WAND_NOT_FOUND);
             return;
         }
-        
+
         boolean touchesOriginalRoi = false;
         for (int p = 0; p < wand.npoints; p++) {
             if (recordBounds.contains((int)wand.xpoints[p], (int)wand.ypoints[p])) {
@@ -227,6 +355,7 @@ public class Segmenter {
             }
         }
         if (!touchesOriginalRoi) {
+            EdgeDiagnostics.record(EdgeDiagnostics.Reason.WAND_OFF_ROI);
             return;
         }
 
@@ -234,20 +363,21 @@ public class Segmenter {
 
         Rectangle bounds = wandRoi.getBounds();
         if(bounds.x <= 0 || bounds.y <= 0 || bounds.x + bounds.width >= imgWidth || bounds.y + bounds.height >= imgHeight) {
+             EdgeDiagnostics.record(EdgeDiagnostics.Reason.BOUNDS_TOUCH_IMAGE);
              return;
         }
         double sumX = 0, sumY = 0;
         int ptCount = wandRoi.getFloatPolygon().npoints;
         float[] xPts = wandRoi.getFloatPolygon().xpoints;
         float[] yPts = wandRoi.getFloatPolygon().ypoints;
-        
-        for (int p = 0; p < ptCount; p++) { 
-            sumX += xPts[p]; 
-            sumY += yPts[p]; 
+
+        for (int p = 0; p < ptCount; p++) {
+            sumX += xPts[p];
+            sumY += yPts[p];
         }
         double centerX = sumX / ptCount;
         double centerY = sumY / ptCount;
-        
+
 
         int padding = 5;
         int rx = Math.max(0, bounds.x - padding);
@@ -255,83 +385,104 @@ public class Segmenter {
         int rw = Math.min(origIp.getWidth() - rx, bounds.width + 2 * padding);
         int rh = Math.min(origIp.getHeight() - ry, bounds.height + 2 * padding);
 
-        origIp.setRoi(rx, ry, rw, rh);
-        blurredIp.setRoi(rx, ry, rw, rh);
+        // ------------------------------------------------------------------
+        // Estimate the edge contrast and the local noise, then choose the
+        // detector's pre-blur sigma and gradient threshold adaptively.
+        //
+        // contrast: full step height. thresholdForEdge sits mid-edge, so
+        //           |mode - thresholdForEdge| is ~ half the contrast.
+        // noise:    std-dev of a thin band JUST OUTSIDE the detected shape. The
+        //           previous estimate used the whole wand-ROI INTERIOR, which for
+        //           objects with internal structure (e.g. a bone-marrow disk inside
+        //           a vertebra) counts that structure's step as "noise": the std-dev
+        //           inflates, CNR collapses, and the adaptive pre-blur over-smooths
+        //           the edge -> the measured MTF droops. The region just outside the
+        //           shape is genuinely homogeneous (background), so it isolates true
+        //           image noise regardless of what is inside the object.
+        // ------------------------------------------------------------------
+        double contrast = 2.0 * Math.abs(mode - thresholdForEdge);
 
-        ImageProcessor cropOrig = blurredIp.crop();
-        origIp.resetRoi();blurredIp.resetRoi();
+        double noise = noiseOutsideShape(origIp, wandRoi);
+        double cnr = noise > 0 ? contrast / noise : Double.POSITIVE_INFINITY;
+        double blurSigma = blurSigmaForCNR(cnr);
+
+        // Detector input: an ADAPTIVELY blurred copy of the ORIGINAL image,
+        // cropped to the padded bounds. (The sigma=1 blurredIp is kept only for
+        // the wand/Otsu/segmentation steps above.)
+        ImageProcessor detectorFull = origIp.duplicate();
+        detectorFull.blurGaussian(blurSigma);
+        detectorFull.setRoi(rx, ry, rw, rh);
+        ImageProcessor cropDetector = detectorFull.crop();
+        detectorFull.resetRoi();
 
         FloatPolygon finalSubpixelPolygon = new FloatPolygon();
 
-        double gradThreshold = 0.5*Math.abs(mode - thresholdForEdge);
-        PartialAreaEdgeDetector.Result paeResult = PartialAreaEdgeDetector.detectAndRestoreIterative(cropOrig, gradThreshold, 2, 10);
-        int iterations = 0;
+        // Gradient threshold, replacing the old 0.5*|mode - thresholdForEdge|.
+        //
+        // The detector thresholds the magnitude of a central difference of the
+        // smoothed image. The threshold must stay BELOW the true edge gradient
+        // at all CNR (otherwise it wipes out detection on low-contrast edges),
+        // while rising enough with noise to reject texture.
+        //
+        // Previously the cap was 0.6*(contrast/3), modelling the edge gradient as
+        // ~contrast/3. That model is wrong for CT: measured on MTF/NPS phantoms
+        // (SOFT and Lung, Bujila 2017 coefficients) the true peak edge gradient
+        // is ~contrast..3*contrast (SOFT ~304, Lung ~574 for contrast 100 due to
+        // edge enhancement), i.e. ~10-17x larger. The contrast/3 cap therefore
+        // forced the threshold BELOW the noise floor at high noise, admitting
+        // stray noise edges (worst on SOFT at high SD). Capping at 0.5*contrast
+        // tracks the real edge gradient: it stays well below the true edge while
+        // still bounding the threshold, halves stray edges at high SD on SOFT,
+        // and is neutral for Lung. Detection at low contrast/high noise is kept
+        // alive by the single 0.6x fallback below.
+        double gradThreshold = Math.min(
+                Math.max(0.9 * noise, 0.12 * contrast),
+                0.5 * contrast);
 
-        while (paeResult.edges.size() < ptCount && iterations < 30) {
-            gradThreshold *= 0.8;
-            paeResult = PartialAreaEdgeDetector.detectAndRestoreIterative(cropOrig, gradThreshold, 2, 10);
-            iterations++;
+        // Restoration iterations reduced 10 -> 3 (convergence; avoids over-sharpening
+        // blurred/soft-kernel edges). The 30x threshold-lowering loop is replaced by
+        // a single, bounded fallback now that the threshold is measured rather than guessed.
+        PartialAreaEdgeDetector.Result paeResult =
+                PartialAreaEdgeDetector.detectAndRestoreIterative(cropDetector, gradThreshold, 2, 1);
+        if (paeResult.edges.size() < ptCount) {
+            paeResult = PartialAreaEdgeDetector.detectAndRestoreIterative(
+                    cropDetector, gradThreshold * 0.6, 2, 1);
         }
 
         FloatProcessor restoredCrop = paeResult.restoredImage;
         Wand cleanWand = new Wand(restoredCrop);
-        
-        if (thresholdForEdge >= mode) { minHU = thresholdForEdge; maxHU = Double.MAX_VALUE; } 
+
+        if (thresholdForEdge >= mode) { minHU = thresholdForEdge; maxHU = Double.MAX_VALUE; }
         else { minHU = -Double.MAX_VALUE; maxHU = thresholdForEdge; }
-        
+
         cleanWand.autoOutline((int)(centerX - rx), (int)(centerY - ry), minHU, maxHU, 8 | 256);
+        // Per-point unit normals, collected in lockstep with finalSubpixelPolygon.
+        List<double[]> finalNormals = new ArrayList<>();
+
+        // Build the sub-pixel boundary by hole-free wand anchoring: the wand outline
+        // is densified and snapped to the partial-area (PAE) sub-pixel edge, a spike
+        // guard rejects spurious matches, genuine gaps are bridged, and the contour is
+        // lightly smoothed. Each kept point carries its own analytic PAE normal.
         if (cleanWand.npoints > 0) {
-            List<Point> denseWand = new ArrayList<>();
-            for (int i = 0; i < cleanWand.npoints; i++) {
-                int x1 = cleanWand.xpoints[i];
-                int y1 = cleanWand.ypoints[i];
-                int nextIdx = (i + 1) % cleanWand.npoints;
-                int x2 = cleanWand.xpoints[nextIdx];
-                int y2 = cleanWand.ypoints[nextIdx];
+            buildPolygonFilled(paeResult, cleanWand, rx, ry, finalSubpixelPolygon, finalNormals);
+        }
 
-                denseWand.add(new Point(x1, y1));
-
-                int steps = Math.max(Math.abs(x2 - x1), Math.abs(y2 - y1));
-                if (steps > 1) {
-                    for (int s = 1; s < steps; s++) {
-                        int interpX = x1 + s * (x2 - x1) / steps;
-                        int interpY = y1 + s * (y2 - y1) / steps;
-                        denseWand.add(new Point(interpX, interpY));
-                    }
-                }
-            }
-            for (Point p : denseWand) {
-                double px = p.x;
-                double py = p.y;
-                PartialAreaEdgeDetector.EdgePixel bestEdge = null;
-                double minDist = Double.MAX_VALUE;
-
-                for (PartialAreaEdgeDetector.EdgePixel ep : paeResult.edges) {
-                    double dist = Math.hypot(ep.x - px, ep.y - py);
-                    if (dist < minDist && dist < 3) { 
-                        minDist = dist;
-                        bestEdge = ep;
-                    }
-                }
-                if (bestEdge != null) {
-                    finalSubpixelPolygon.addPoint((float)(bestEdge.x + rx), (float)(bestEdge.y + ry));
-                }
-            }
-        }	
         double circularity = getCircularity(finalSubpixelPolygon);
         if (circularity < 0.3) {
+            EdgeDiagnostics.record(EdgeDiagnostics.Reason.LOW_CIRCULARITY);
             return;
         }
-        
+
         PolygonRoi finalRoi =  new PolygonRoi(finalSubpixelPolygon, Roi.POLYLINE);
-            
+
         List<Double> edgeContrasts = new ArrayList<>();
 
         for (PartialAreaEdgeDetector.EdgePixel ep : paeResult.edges) {
-             double valI0 = cal.getCValue(ep.i0);
-             double valI1 = cal.getCValue(ep.i1);
-             double contrast = Math.abs(valI1 - valI0);
-             edgeContrasts.add(contrast);
+             double[] flat = contrastAwayFromEdge(origIp, ep.x + rx, ep.y + ry, ep.nx, ep.ny, ep.i0, ep.i1);
+             double valI0 = cal.getCValue(flat[0]);
+             double valI1 = cal.getCValue(flat[1]);
+             double c = Math.abs(valI1 - valI0);
+             edgeContrasts.add(c);
         }
 
         List<Double> expectedContrasts = new ArrayList<>();
@@ -341,28 +492,29 @@ public class Segmenter {
         if (!edgeContrasts.isEmpty()) {
              double minC = Collections.min(edgeContrasts);
              double maxC = Collections.max(edgeContrasts);
-             
+
              double binSize = 15.0;
              int numBins = (int) Math.ceil((maxC - minC) / binSize) + 1;
-             
+
              int[] histogram = new int[numBins];
              double[] sumInBin = new double[numBins];
-             
+
              double[] sumI0InBin = new double[numBins];
              double[] sumI1InBin = new double[numBins];
-             
+
              for (PartialAreaEdgeDetector.EdgePixel ep : paeResult.edges) {
-                 double valI0 = cal.getCValue(ep.i0);
-                 double valI1 = cal.getCValue(ep.i1);
+                 double[] flat = contrastAwayFromEdge(origIp, ep.x + rx, ep.y + ry, ep.nx, ep.ny, ep.i0, ep.i1);
+                 double valI0 = cal.getCValue(flat[0]);
+                 double valI1 = cal.getCValue(flat[1]);
                  double c = Math.abs(valI1 - valI0);
-                 
+
                  int bin = (int) ((c - minC) / binSize);
                  histogram[bin]++;
                  sumInBin[bin] += c;
                  sumI0InBin[bin] += valI0;
                  sumI1InBin[bin] += valI1;
              }
-             
+
              int maxBin1 = -1;
              int maxCount1 = 0;
              for (int i = 0; i < numBins; i++) {
@@ -371,17 +523,17 @@ public class Segmenter {
                      maxBin1 = i;
                  }
              }
-             
+
              if (maxCount1 > 0) {
                  expectedContrasts.add(sumInBin[maxBin1] / maxCount1);
                  expectedI0.add(sumI0InBin[maxBin1] / maxCount1);
                  expectedI1.add(sumI1InBin[maxBin1] / maxCount1);
              }
-             
+
              int maxBin2 = -1;
              int maxCount2 = 0;
              int minSeparationBins = (int) (20.0 / binSize);
-             
+
              for (int i = 0; i < numBins; i++) {
                  if (Math.abs(i - maxBin1) > minSeparationBins) {
                      if (histogram[i] > maxCount2) {
@@ -390,29 +542,39 @@ public class Segmenter {
                      }
                  }
              }
-             
+
              if (maxBin2 != -1 && maxCount2 >= (maxCount1 * 0.2)) {
                  expectedContrasts.add(sumInBin[maxBin2] / maxCount2);
                  expectedI0.add(sumI0InBin[maxBin2] / maxCount2);
                  expectedI1.add(sumI1InBin[maxBin2] / maxCount2);
              }
         }
-        
-        if (expectedContrasts.isEmpty() || expectedContrasts.get(0) < 5) return;
-     
+
+        if (expectedContrasts.isEmpty() || expectedContrasts.get(0) < 5) {
+            EdgeDiagnostics.record(EdgeDiagnostics.Reason.CONTRAST_GATE);
+            return;
+        }
+        EdgeDiagnostics.record(EdgeDiagnostics.Reason.ACCEPTED);
+
         dR.modeContrast.add(expectedContrasts);
         dR.meanI0.add(expectedI0);
         dR.meanI1.add(expectedI1);
-        
+
         blurredIp.setRoi(wandRoi);
         ImageStatistics stats1 = blurredIp.getStatistics();
         double insertHU = Math.round(cal.getCValue(stats1.histMin + stats1.mode * stats1.binSize));
-        
+
         dR.HU.add(insertHU);
         dR.Threshold.add(cal.getCValue(thresholdForEdge));
-        
+
         dR.roi.add(finalRoi);
-        
+        dR.edgeNormalsPerRoi.add(finalNormals.toArray(new double[0][]));
+
+        // Register per-structure contrast/noise/CNR for later UI display.
+        dR.contrast.add(contrast);
+        dR.noise.add(noise);
+        dR.cnr.add(cnr);
+
         dR.Pos.add(new Point((int)Math.round(centerX), (int)Math.round(centerY)));
 
         if (processedMask != null) {
@@ -421,27 +583,226 @@ public class Segmenter {
         }
     }
 
+
+    /**
+     * Option B: hole-FREE wand anchoring with spike guard and smoothing.
+     *
+     * Keeps the wand-anchored contour (minimal change to the trusted geometry) but
+     * removes the "holes" the strict 3 px snap-or-drop leaves. Pipeline:
+     *
+     *   1. Densify the wand outline (as before) to get an ordered point sequence.
+     *   2. For each densified point, snap to the nearest PAE edge within FILL_TOL_PX.
+     *      This alone fills most gaps but can introduce "spikes": a point near a PAE
+     *      gap may grab a pixel from another part of the contour, jutting off the edge.
+     *   3. SPIKE GUARD (trajectory-based, shape-agnostic): reject a snapped point only
+     *      if it lies more than FILL_SPIKE_PX from the straight line through its
+     *      nearest accepted neighbours on each side. This does NOT assume a convex /
+     *      star-shaped contour, so pointed features far from the centre (e.g. vertebra
+     *      wing tips) are kept while lone off-trajectory matches are rejected.
+     *      Rejected points become gaps (not spikes).
+     *   4. RESOLVE non-PAE points: a spike-rejected point is bridged by interpolation
+     *      between its trusted neighbours; a point with simply no PAE match keeps the
+     *      wand position (the wand already traces the true silhouette), so long shallow
+     *      segments are not chorded across. Normals are interpolated where needed.
+     *   5. SMOOTH: a light moving-average (FILL_SMOOTH half-window) on the positions
+     *      to remove residual jitter.
+     *
+     * Emits points in image coordinates with aligned unit normals.
+     */
+    private static void buildPolygonFilled(PartialAreaEdgeDetector.Result paeResult, Wand wand,
+            int rx, int ry, FloatPolygon outPoly, List<double[]> outNormals) {
+        if (wand.npoints <= 0 || paeResult == null || paeResult.edges == null
+                || paeResult.edges.isEmpty()) return;
+
+        double fillTol   = FILL_TOL_PX;
+        double spikeTol  = FILL_SPIKE_PX;
+        int smoothHalf   = FILL_SMOOTH;
+
+        // 1) densify wand outline (crop coords)
+        List<Point> dense = new ArrayList<>();
+        for (int i = 0; i < wand.npoints; i++) {
+            int x1 = wand.xpoints[i], y1 = wand.ypoints[i];
+            int ni = (i + 1) % wand.npoints;
+            int x2 = wand.xpoints[ni], y2 = wand.ypoints[ni];
+            dense.add(new Point(x1, y1));
+            int steps = Math.max(Math.abs(x2 - x1), Math.abs(y2 - y1));
+            for (int s = 1; s < steps; s++) {
+                dense.add(new Point(x1 + s * (x2 - x1) / steps, y1 + s * (y2 - y1) / steps));
+            }
+        }
+        int n = dense.size();
+        if (n < 3) return;
+
+        // 2) snap each densified point to nearest PAE edge within the wider tolerance.
+        //    ok[i] = a PAE sub-pixel match was found. Points without a match keep the
+        //    WAND position as a provisional location (see step 4): the wand already
+        //    traces the true silhouette, so a wand point is a far better boundary
+        //    estimate than interpolating a chord across the gap. This matters on
+        //    long shallow segments (e.g. a vertebra wing underside) where the
+        //    densified wand line runs a few px off the discrete PAE edge pixels, so
+        //    interpolated points legitimately find no PAE match within tolerance.
+        double[] px = new double[n], py = new double[n], pnx = new double[n], pny = new double[n];
+        boolean[] ok = new boolean[n];
+        for (int i = 0; i < n; i++) {
+            double qx = dense.get(i).x, qy = dense.get(i).y;
+            PartialAreaEdgeDetector.EdgePixel best = null;
+            double minDist = Double.MAX_VALUE;
+            for (PartialAreaEdgeDetector.EdgePixel ep : paeResult.edges) {
+                double d = Math.hypot(ep.x - qx, ep.y - qy);
+                if (d < minDist && d < fillTol) { minDist = d; best = ep; }
+            }
+            if (best != null) {
+                px[i] = best.x; py[i] = best.y; pnx[i] = best.nx; pny[i] = best.ny;
+                ok[i] = true;
+            } else {
+                px[i] = qx; py[i] = qy;        // provisional: the wand point itself
+            }
+        }
+
+        // 3) spike guard (TRAJECTORY-based, shape-agnostic): a spurious match juts
+        //    off the local edge trajectory, i.e. it lies far from the straight line
+        //    through its nearest accepted neighbours ON EACH SIDE. This is measured
+        //    as the point's perpendicular distance to that chord. Unlike a
+        //    radius-from-centroid test, it does NOT assume a convex/star-shaped
+        //    contour, so legitimate far-from-centre features (e.g. the pointed wing
+        //    tips of a vertebra) are kept: there the neighbours continue along the
+        //    same direction, so the perpendicular deviation stays small. Only a lone
+        //    point stepping off an otherwise-smooth local run is rejected.
+        boolean[] spike = new boolean[n];
+        for (int i = 0; i < n; i++) {
+            if (!ok[i]) continue;
+            // nearest accepted neighbour before and after i along the ordering
+            int prev = i, fwd = i, bs = 0, fs = 0;
+            do { prev = (prev - 1 + n) % n; bs++; } while (!ok[prev] && bs < n);
+            do { fwd = (fwd + 1) % n; fs++; } while (!ok[fwd] && fs < n);
+            if (prev == i || fwd == i || prev == fwd) continue;   // not enough context
+            double ax = px[prev], ay = py[prev], bx = px[fwd], by = py[fwd];
+            double vx = bx - ax, vy = by - ay;
+            double vlen = Math.hypot(vx, vy);
+            if (vlen < 1e-9) continue;
+            // perpendicular distance from point i to the chord prev->fwd
+            double perp = Math.abs((px[i] - ax) * vy - (py[i] - ay) * vx) / vlen;
+            if (perp > spikeTol) spike[i] = true;
+        }
+        for (int i = 0; i < n; i++) if (spike[i]) ok[i] = false;   // demote spikes to gaps
+
+        long holes = 0;
+        for (int i = 0; i < n; i++) if (!ok[i]) holes++;
+        if (holes == n) return;   // nothing usable
+
+        // 4) resolve non-PAE points. Two cases:
+        //    - spike-rejected: the PAE match was spurious, so DISCARD its position and
+        //      bridge by interpolation (position + normal) between trusted neighbours.
+        //    - no PAE match (not a spike): KEEP the wand position already stored in
+        //      px/py (the wand traces the true silhouette); only the NORMAL needs to
+        //      be borrowed from the nearest trusted neighbours. This stops long
+        //      shallow segments from being chorded across.
+        for (int i = 0; i < n; i++) {
+            if (ok[i]) continue;
+            int prev = i, fwd = i, backSteps = 0, fwdSteps = 0;
+            do { prev = (prev - 1 + n) % n; backSteps++; } while (!ok[prev] && backSteps < n);
+            do { fwd = (fwd + 1) % n; fwdSteps++; } while (!ok[fwd] && fwdSteps < n);
+            double t = (double) backSteps / (backSteps + fwdSteps);
+            if (!spike[i]) {
+                // keep the wand position (px/py already hold it); interpolate only the normal
+            } else {
+                px[i]  = (1 - t) * px[prev]  + t * px[fwd];
+                py[i]  = (1 - t) * py[prev]  + t * py[fwd];
+            }
+            double ix = (1 - t) * pnx[prev] + t * pnx[fwd];
+            double iy = (1 - t) * pny[prev] + t * pny[fwd];
+            double len = Math.hypot(ix, iy);
+            if (len == 0) { pnx[i] = pnx[prev]; pny[i] = pny[prev]; }
+            else { pnx[i] = ix / len; pny[i] = iy / len; }
+        }
+
+        // 5) light position smoothing (moving average) along the ordering
+        double[] sx = px, sy = py;
+        if (smoothHalf > 0) {
+            sx = new double[n]; sy = new double[n];
+            for (int i = 0; i < n; i++) {
+                double ax = 0, ay = 0; int c = 0;
+                for (int w = -smoothHalf; w <= smoothHalf; w++) {
+                    int j = ((i + w) % n + n) % n;
+                    ax += px[j]; ay += py[j]; c++;
+                }
+                sx[i] = ax / c; sy[i] = ay / c;
+            }
+        }
+
+        for (int i = 0; i < n; i++) {
+            outPoly.addPoint((float) (sx[i] + rx), (float) (sy[i] + ry));
+            outNormals.add(new double[]{ pnx[i], pny[i] });
+
+        }
+    }
+
+    /**
+     * Overshoot-robust edge contrast for a single sub-pixel edge pixel.
+     *
+     * The PAE detector's ep.i0/ep.i1 are taken from the smoothed intensities
+     * INSIDE the detector window (+/-4 px around the edge). For edge-enhancing
+     * reconstruction kernels (Lung, Bone, Edge, ...) that window straddles the
+     * overshoot/undershoot ringing, so i1-i0 overestimates the true step height
+     * (e.g. ~122 HU measured vs a 100 HU step on Lung). That inflated value then
+     * fails to match the ESF endpoint contrast (measured in the flat regions),
+     * so every ESF profile is rejected and the TTF cannot be computed at low noise.
+     *
+     * This samples the image a standoff distance beyond the ringing, on both
+     * sides of the edge along its normal, averaging a few samples for stability.
+     * Falls back to the PAE i0/i1 if sampling leaves the image.
+     *
+     * @param ipRaw  raw image to sample (same coordinate frame as x,y)
+     * @param x,y    edge position (image coordinates)
+     * @param nx,ny  unit edge normal
+     * @return {valLow, valHigh} as RAW intensities (not yet calibrated)
+     */
+    private static double[] contrastAwayFromEdge(ImageProcessor ipRaw, double x, double y,
+                                                 double nx, double ny,
+                                                 double fallbackLow, double fallbackHigh) {
+        // Standoff past the overshoot lobes; averaged over a short run to reduce noise.
+        final double standoff = 5.0;   // px; beyond the typical ringing extent
+        final int    nAvg     = 3;     // samples averaged per side
+        final double sampleStep = 1.0; // px between averaged samples
+
+        double sumA = 0, sumB = 0;
+        int cntA = 0, cntB = 0;
+        int w = ipRaw.getWidth(), h = ipRaw.getHeight();
+        for (int s = 0; s < nAvg; s++) {
+            double d = standoff + s * sampleStep;
+            double ax = x + nx * d, ay = y + ny * d;   // one side (outer/inner)
+            double bx = x - nx * d, by = y - ny * d;   // the other side
+            if (ax >= 0 && ay >= 0 && ax < w && ay < h) { sumA += ipRaw.getInterpolatedValue(ax, ay); cntA++; }
+            if (bx >= 0 && by >= 0 && bx < w && by < h) { sumB += ipRaw.getInterpolatedValue(bx, by); cntB++; }
+        }
+        if (cntA == 0 || cntB == 0) {
+            return new double[]{ Math.min(fallbackLow, fallbackHigh), Math.max(fallbackLow, fallbackHigh) };
+        }
+        double va = sumA / cntA, vb = sumB / cntB;
+        return new double[]{ Math.min(va, vb), Math.max(va, vb) };
+    }
+
     private static double getCircularity(FloatPolygon fp) {
         int n = fp.npoints;
         if (n < 3) return 0;
         double area = 0;
         double perimeter = 0;
-        
+
         for (int i = 0; i < n; i++) {
             int next = (i + 1) % n;
             float x1 = fp.xpoints[i], y1 = fp.ypoints[i];
             float x2 = fp.xpoints[next], y2 = fp.ypoints[next];
-            
+
             area += (x1 * y2) - (x2 * y1);
             perimeter += Math.hypot(x2 - x1, y2 - y1);
         }
         area = Math.abs(area / 2.0);
-        
+
         if (perimeter == 0) return 0;
         return 4.0 * Math.PI * (area / (perimeter * perimeter));
     }
 
-    private static ImageProcessor calcularMedia(ImageStack stack) {
+    private static ImageProcessor averageStack(ImageStack stack) {
         int width = stack.getWidth();
         int height = stack.getHeight();
         FloatProcessor avgSlice = new FloatProcessor(width, height);
@@ -457,7 +818,7 @@ public class Segmenter {
                 }
             }
         }
-        
+
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
                 avgSlice.setf(x, y, avgSlice.getf(x, y) / size);
@@ -501,13 +862,13 @@ public class Segmenter {
 
 		total_mean = mean[data.length-1];
 
-		threshold = 0; 
+		threshold = 0;
 		max_bcv = 0.0;
 
 		for ( ih = 0; ih < data.length; ih++ ) {
 			double denom = cnh[ih] * ( 1.0 - cnh[ih] );
-			if (denom <= 0.0) continue; 
-			
+			if (denom <= 0.0) continue;
+
 			bcv = total_mean * cnh[ih] - mean[ih];
 			bcv *= bcv / denom;
 
@@ -516,12 +877,13 @@ public class Segmenter {
 				threshold = ih;
 			}
 		}
-		
+
 	    OtsuResult or = new OtsuResult();
 	    or.max_bcv = max_bcv;
-	    or.threshold = threshold;	    	    
+	    or.threshold = threshold;
 	    return or;
 	}
+
     public static PolygonRoi segmenter(ImageProcessor ip, Calibration cal, double minHU, double minArea, double minCircularity, boolean useManager, int slicenumber, int radius) {
     	PolygonRoi largerRoi = null;
         double largerArea = 0;
@@ -537,12 +899,12 @@ public class Segmenter {
             }
         }
         ByteProcessor filledMask = fillHoles(Mask);
-        
+
         ByteProcessor erodedMask = filledMask;
         if(radius != 0) {
             erodedMask = erode(filledMask, radius);
         }
-        
+
         Wand wand = new Wand(erodedMask);
 
         for (int y = 0; y < ip.getHeight(); y++) {
@@ -552,11 +914,11 @@ public class Segmenter {
                     if (wand.npoints > 0) {
                         PolygonRoi erodedRoi = new PolygonRoi(wand.xpoints, wand.ypoints, wand.npoints, Roi.FREEROI);
                       Rectangle bounds = erodedRoi.getBounds();
-                      boolean touchesEdge = (bounds.x <= 0 || 
-                                bounds.y <= 0 || 
-                                bounds.x + bounds.width >= ip.getWidth() || 
+                      boolean touchesEdge = (bounds.x <= 0 ||
+                                bounds.y <= 0 ||
+                                bounds.x + bounds.width >= ip.getWidth() ||
                                 bounds.y + bounds.height >= ip.getHeight());
-         
+
 						if (touchesEdge) {
 						continue;
 						}
@@ -564,7 +926,7 @@ public class Segmenter {
                         if(radius != 0) {
                             dilatedRoi = dilate(filledMask, erodedRoi, radius);
                         }
-                        
+
                         ip.setRoi(dilatedRoi);
                         ImageStatistics stats = ImageStatistics.getStatistics(ip, 0, cal);
                         double area = stats.area;
@@ -622,12 +984,12 @@ public class Segmenter {
          ByteProcessor dilatedMask = new ByteProcessor(mask.getWidth(), mask.getHeight());
          dilatedMask.setColor(255); dilatedMask.fill();
          dilatedMask.setColor(0); dilatedMask.fill(roi);
-        
+
          FloatProcessor edm = new EDM().makeFloatEDM(dilatedMask.duplicate(), 0, false);
          float[] edmPixels = (float[]) edm.getPixels();
          byte[] dilatedPixels = (byte[]) dilatedMask.getPixels();
          byte[] originalPixels = (byte[]) mask.getPixels();
-        
+
          for (int y = 0; y < mask.getHeight(); y++) {
              for (int x = 0; x < mask.getWidth(); x++) {
                  int index = y * mask.getWidth() + x;
@@ -636,7 +998,7 @@ public class Segmenter {
                  }
              }
          }
-        
+
          Wand wand = new Wand(dilatedMask);
          for (int y = 0; y < dilatedMask.getHeight(); y++) {
              for (int x = 0; x < dilatedMask.getWidth(); x++) {
@@ -659,8 +1021,8 @@ public class Segmenter {
         int height = filledIp.getHeight();
         int background = 0;
         int foreground = 255;
-        int tempValue = 127; 
-        
+        int tempValue = 127;
+
         FloodFiller ff = new FloodFiller(filledIp);
         filledIp.setColor(tempValue);
 
@@ -702,13 +1064,13 @@ public class Segmenter {
             double angle = 2 * Math.PI * i / recordNumber;
             double roiCenterX = centerX + recordRadiusPixels * Math.cos(angle);
             double roiCenterY = centerY + recordRadiusPixels * Math.sin(angle);
-            
+
             Roi roi = new Roi(
-                (int)(roiCenterX - recordSizePixels/2), 
+                (int)(roiCenterX - recordSizePixels/2),
                 (int)(roiCenterY - recordSizePixels/2),
-                (int)recordSizePixels, 
+                (int)recordSizePixels,
                 (int)recordSizePixels);
-            
+
             recordRois.add(roi);
             if (useManager) {
                 RoiManager roiManager = RoiManager.getInstance();
@@ -719,5 +1081,5 @@ public class Segmenter {
         }
         return recordRois;
     }
-    
+
 }

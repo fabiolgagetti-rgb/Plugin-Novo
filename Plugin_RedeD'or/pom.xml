@@ -72,8 +72,8 @@
     </issueManagement>
 
     <properties>
-        <package-name>br.unifesp.fisicamedica</package-name>
-        <main-class>br.unifesp.fisicamedica.DetectabilidadePlugin</main-class>
+        <package-name>br.rededor.fisicamedica</package-name>
+        <main-class>br.rededor.fisicamedica.DetectabilidadePlugin</main-class>
 
         <license.licenseName>MIT License</license.licenseName>
         <license.copyrightOwners>UNIFESP</license.copyrightOwners>
@@ -157,8 +157,7 @@
             <artifactId>maven-compiler-plugin</artifactId>
             <version>3.11.0</version>
             <configuration>
-                <source>1.8</source>
-                <target>1.8</target>
+                <release>8</release>
             </configuration>
         </plugin>
 
@@ -199,7 +198,7 @@
     <artifactId>exec-maven-plugin</artifactId>
     <version>3.1.0</version>
     <configuration>
-        <mainClass>br.unifesp.fisicamedica.Tester</mainClass>
+        <mainClass>br.rededor.fisicamedica.Tester</mainClass>
         <classpathScope>test</classpathScope>
     </configuration>
 </plugin>
