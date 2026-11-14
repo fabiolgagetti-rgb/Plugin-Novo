@@ -1,21 +1,21 @@
 /*
 Copyright (c) 2017, Agustin Trujillo-Pino
 All rights reserved.
- 
+
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
- 
+
 * Redistributions of source code must retain the above copyright notice, this
   list of conditions and the following disclaimer.
- 
+
 * Redistributions in binary form must reproduce the above copyright notice,
   this list of conditions and the following disclaimer in the documentation
   and/or other materials provided with the distribution
- 
+
 * Neither the name of University Las Palmas Gran Canaria nor the names of its
   contributors may be used to endorse or promote products derived from this
   software without specific prior written permission.
- 
+
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
@@ -33,13 +33,48 @@ package br.rededor.fisicamedica;
 import ij.process.FloatProcessor;
 import ij.process.ImageProcessor;
 
-import java.awt.geom.Point2D;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Subpixel edge detector based on the partial-area effect
+ * (Trujillo-Pino et al., Image and Vision Computing 31(1), 2013),
+ * with iterative restoration (section 6 of the paper).
+ *
+ * Port of finalDetectorIterN.m. The same logic handles "horizontal" edges
+ * (|Gy| dominant, 9x3 window) and "vertical" edges (|Gx| dominant, 3x9 window):
+ * the code works in (c, k) coordinates, where c is the transverse offset
+ * (columns -1, 0, +1 of the window) and k the offset along it.
+ *
+ * Coordinate convention: the x and y of EdgePixel are 0-based with the pixel
+ * CENTER at integer values. To use them in ImageJ ROIs (vertices at pixel
+ * corners) add 0.5 to x and y.
+ */
 public class PartialAreaEdgeDetector {
-	
-	public static class EdgePixel {
+
+    /**
+     * "Nearby second edge" test (section 5.2 of the paper).
+     * false = literal from finalDetectorIterN.m (compares the smoothed image G).
+     * true  = as described in the paper (section 5.2, Figs. 15d/16c: uses the derivative).
+     */
+    public static boolean defaultCloseEdgeOnGradient = false;
+
+    /**
+     * Diagnostic (A/B). false = the synthetic patch uses each edge's original window
+     * (as in finalDetectorIterN.m). true = reproduces the previous version of this class,
+     * which passed the patch the limits ALREADY changed by the nearby-edge correction.
+     */
+    public static boolean legacyPatchWindow = false;
+
+    private static final double W = 0.75;               // uniform 3x3 mask
+    private static final double MAX_VALID_OFFSET = 1.0;
+    private static final double R_MIN = 4.5;
+    private static final double R_MAX = 1e4;
+    private static final double WEIGHT_MIDDLE = 100.0;
+    private static final int GRID = 50;                 // sampling per partial pixel
+    private static final double HALF_DIAGONAL = Math.sqrt(0.5) + 1e-9;
+
+    public static class EdgePixel {
         public double x, y;
         public double nx, ny;
         public double curvature;
@@ -51,558 +86,404 @@ public class PartialAreaEdgeDetector {
         public List<EdgePixel> edges;
     }
 
-    public static Result detectAndRestore(
-            ImageProcessor ip,
-            double threshold,
-            int order
-    ) {
+    // ------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------
 
-        int rows = ip.getHeight();
-        int cols = ip.getWidth();
+    public static Result detectAndRestore(ImageProcessor ip, double threshold, int order) {
+        return detectAndRestore(ip, threshold, order, defaultCloseEdgeOnGradient);
+    }
 
-        FloatProcessor F = (FloatProcessor) ip.convertToFloat();
-        FloatProcessor G = smooth3x3(F);
+    public static Result detectAndRestore(ImageProcessor ip, double threshold, int order,
+                                          boolean closeEdgeOnGradient) {
+        double[][] f = toArray(ip);
+        Context ctx = run(f, threshold, order, closeEdgeOnGradient);
+        return toResult(ctx, finish(ctx));
+    }
 
-        double[][] Gx = new double[rows][cols];
-        double[][] Gy = new double[rows][cols];
-        double[][] grad = new double[rows][cols];
+    public static Result detectAndRestoreIterative(ImageProcessor ip, double threshold,
+                                                   int order, int iterations) {
+        return detectAndRestoreIterative(ip, threshold, order, iterations,
+                defaultCloseEdgeOnGradient);
+    }
 
-        computeGradients(G, Gx, Gy, grad);
+    /** Keeps the restored image in double precision between iterations (as in MATLAB). */
+    public static Result detectAndRestoreIterative(ImageProcessor ip, double threshold,
+                                                   int order, int iterations,
+                                                   boolean closeEdgeOnGradient) {
+        double[][] current = toArray(ip);
+        Context last = null;
+        double[][] restored = null;
+        int n = Math.max(1, iterations);
+        for (int it = 0; it < n; it++) {
+            last = run(current, threshold, order, closeEdgeOnGradient);
+            restored = finish(last);
+            current = restored;
+        }
+        return toResult(last, restored);
+    }
 
-        FloatProcessor restored = new FloatProcessor(cols, rows);
-        FloatProcessor counter = new FloatProcessor(cols, rows);
+    // ------------------------------------------------------------------
+    // State of a single detection pass
+    // ------------------------------------------------------------------
 
-        List<EdgePixel> edges = new ArrayList<>();
+    private static final class Context {
+        final int w, h;
+        final double[][] F, G, Gx, Gy, grad;
+        final double threshold;
+        final int order;
+        final boolean gradClose;
+        final double[][] acc, cnt;
+        final List<EdgePixel> edges = new ArrayList<>();
 
-        detectEdges(G, F, Gx, Gy, grad, threshold, order,
-                restored, counter, edges, true);
+        Context(double[][] f, double threshold, int order, boolean gradClose) {
+            this.F = f;
+            this.h = f.length;
+            this.w = h > 0 ? f[0].length : 0;
+            this.threshold = threshold;
+            this.order = order;
+            this.gradClose = gradClose;
 
-        detectEdges(G, F, Gx, Gy, grad, threshold, order,
-                restored, counter, edges, false);
+            // 3x3 smoothing (image borders stay equal to F)
+            G = new double[h][w];
+            for (int y = 0; y < h; y++) System.arraycopy(f[y], 0, G[y], 0, w);
+            for (int y = 1; y < h - 1; y++) {
+                for (int x = 1; x < w - 1; x++) {
+                    double sum = 0;
+                    for (int j = -1; j <= 1; j++)
+                        for (int i = -1; i <= 1; i++)
+                            sum += f[y + j][x + i];
+                    G[y][x] = sum / 9.0;
+                }
+            }
 
-        for (int y = 0; y < rows; y++) {
-            for (int x = 0; x < cols; x++) {
-                float c = counter.getf(x, y);
-                if (c > 0) {
-                    restored.setf(x, y, restored.getf(x, y) / c);
-                } else {
-                    restored.setf(x, y, G.getf(x, y));
+            // central derivatives; as in MATLAB, Gx covers all rows and Gy all columns
+            Gx = new double[h][w];
+            Gy = new double[h][w];
+            grad = new double[h][w];
+            for (int y = 0; y < h; y++)
+                for (int x = 1; x < w - 1; x++)
+                    Gx[y][x] = 0.5 * (G[y][x + 1] - G[y][x - 1]);
+            for (int y = 1; y < h - 1; y++)
+                for (int x = 0; x < w; x++)
+                    Gy[y][x] = 0.5 * (G[y + 1][x] - G[y - 1][x]);
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                    grad[y][x] = Math.hypot(Gx[y][x], Gy[y][x]);
+
+            acc = new double[h][w];
+            cnt = new double[h][w];
+        }
+    }
+
+    private static Context run(double[][] f, double threshold, int order, boolean gradClose) {
+        Context ctx = new Context(f, threshold, order, gradClose);
+        final int w = ctx.w, h = ctx.h;
+
+        // edges with maximal |Gy| (9x3 window)
+        for (int y = 5; y <= h - 6; y++) {
+            for (int x = 2; x <= w - 3; x++) {
+                if (!(ctx.grad[y][x] > threshold)) continue;
+                double absGy = Math.abs(ctx.Gy[y][x]);
+                if (absGy >= Math.abs(ctx.Gx[y][x])
+                        && absGy >= Math.abs(ctx.Gy[y - 1][x])
+                        && absGy > Math.abs(ctx.Gy[y + 1][x])) {
+                    processEdgePixel(ctx, x, y, true);
                 }
             }
         }
 
-        Result result = new Result();
-        result.restoredImage = restored;
-        result.edges = edges;
-
-        return result;
-    }
-    private static FloatProcessor smooth3x3(FloatProcessor ip) {
-        FloatProcessor out = (FloatProcessor) ip.duplicate();
-        int w = ip.getWidth();
-        int h = ip.getHeight();
-
-        for (int y = 1; y < h - 1; y++) {
-            for (int x = 1; x < w - 1; x++) {
-                float sum = 0f;
-                for (int j = -1; j <= 1; j++) {
-                    for (int i = -1; i <= 1; i++) {
-                        sum += ip.getf(x + i, y + j);
-                    }
+        // edges with maximal |Gx| (3x9 window)
+        for (int y = 2; y <= h - 3; y++) {
+            for (int x = 5; x <= w - 6; x++) {
+                if (!(ctx.grad[y][x] > threshold)) continue;
+                double absGx = Math.abs(ctx.Gx[y][x]);
+                if (absGx > Math.abs(ctx.Gy[y][x])
+                        && absGx >= Math.abs(ctx.Gx[y][x - 1])
+                        && absGx > Math.abs(ctx.Gx[y][x + 1])) {
+                    processEdgePixel(ctx, x, y, false);
                 }
-                out.setf(x, y, sum / 9f);
+            }
+        }
+        return ctx;
+    }
+
+    /** Final image: I/C where C>0, otherwise G. */
+    private static double[][] finish(Context ctx) {
+        double[][] out = new double[ctx.h][ctx.w];
+        for (int y = 0; y < ctx.h; y++) {
+            for (int x = 0; x < ctx.w; x++) {
+                double c = ctx.cnt[y][x];
+                out[y][x] = (c > 0) ? ctx.acc[y][x] / c : ctx.G[y][x];
             }
         }
         return out;
     }
-    private static void computeGradients(
-            FloatProcessor G,
-            double[][] Gx,
-            double[][] Gy,
-            double[][] grad
-    ) {
-        int w = G.getWidth();
-        int h = G.getHeight();
 
-        for (int y = 1; y < h - 1; y++) {
-            for (int x = 1; x < w - 1; x++) {
-                Gx[y][x] = 0.5 * (G.getf(x + 1, y) - G.getf(x - 1, y));
-                Gy[y][x] = 0.5 * (G.getf(x, y + 1) - G.getf(x, y - 1));
-                grad[y][x] = Math.hypot(Gx[y][x], Gy[y][x]);
-            }
-        }
+    private static Result toResult(Context ctx, double[][] restored) {
+        FloatProcessor out = new FloatProcessor(ctx.w, ctx.h);
+        for (int y = 0; y < ctx.h; y++)
+            for (int x = 0; x < ctx.w; x++)
+                out.setf(x, y, (float) restored[y][x]);
+        Result r = new Result();
+        r.restoredImage = out;
+        r.edges = ctx.edges;
+        return r;
     }
-    private static void detectEdges(
-            FloatProcessor G,
-            FloatProcessor F,
-            double[][] Gx,
-            double[][] Gy,
-            double[][] grad,
-            double threshold,
-            int order,
-            FloatProcessor restored,
-            FloatProcessor counter,
-            List<EdgePixel> edges,
-            boolean gyDominant
-    ) {
-        int w = G.getWidth();
-        int h = G.getHeight();
 
-        if (gyDominant) {
-
-            for (int y = 5; y < h - 5; y++) {
-                for (int x = 2; x < w - 2; x++) {
-                    if (grad[y][x] <= threshold) continue;
-
-                    double absGy = Math.abs(Gy[y][x]);
-                    double absGx = Math.abs(Gx[y][x]);
-
-                    if (absGy >= absGx &&
-                        absGy >= Math.abs(Gy[y - 1][x]) &&
-                        absGy > Math.abs(Gy[y + 1][x])) {
-
-                        processEdgePixel(x, y, G, F, Gx, Gy, order, threshold, restored, counter, edges, true);
-                    }
-                }
-            }
-        } else {
-
-            for (int y = 2; y < h - 2; y++) {
-                for (int x = 5; x < w - 5; x++) {
-                    if (grad[y][x] <= threshold) continue;
-
-                    double absGx = Math.abs(Gx[y][x]);
-                    double absGy = Math.abs(Gy[y][x]);
-                    if (absGx > absGy &&
-                        absGx >= Math.abs(Gx[y][x - 1]) &&
-                        absGx > Math.abs(Gx[y][x + 1])) {
-
-                        processEdgePixel(x, y, G, F, Gx, Gy, order, threshold, restored, counter, edges, false);
-                    }
-                }
-            }
-        }
+    private static double[][] toArray(ImageProcessor ip) {
+        FloatProcessor fp = (FloatProcessor) ip.convertToFloat();
+        int w = fp.getWidth(), h = fp.getHeight();
+        double[][] f = new double[h][w];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                f[y][x] = fp.getf(x, y);
+        return f;
     }
-    private static void processEdgePixel(
-            int x, int y,
-            FloatProcessor G, FloatProcessor F,
-            double[][] Gx, double[][] Gy,
-            int order, double threshold,
-            FloatProcessor restored, FloatProcessor counter,
-            List<EdgePixel> edges, boolean gyDominant
-    ) {
-        double w = 0.75;
-        double gx = Gx[y][x];
-        double gy = Gy[y][x];
 
-        int m;
-        int l1, r2, minl1, maxr2, l2, r1, maxl2, minr1;
-        int m1 = -1, m2 = 1;
+    // ------------------------------------------------------------------
+    // Access in (transverse c, longitudinal k) coordinates
+    // ------------------------------------------------------------------
 
+    /** dom=true: (x+c, y+k); dom=false: (x+k, y+c). */
+    private static double at(double[][] a, int x, int y, int c, int k, boolean dom) {
+        return dom ? a[y + k][x + c] : a[y + c][x + k];
+    }
+
+    // ------------------------------------------------------------------
+    // Core: a single edge pixel
+    // ------------------------------------------------------------------
+
+    private static void processEdgePixel(Context ctx, int x, int y, boolean dom) {
+        final double[][] F = ctx.F, G = ctx.G;
+        final double[][] Gm = dom ? ctx.Gy : ctx.Gx;   // dominant gradient
+        final double gx = ctx.Gx[y][x];
+        final double gy = ctx.Gy[y][x];
+        final double gm = dom ? gy : gx;
+
+        // ---- floating window limits (section 5.1) ----
+        final int m;
+        final int minl1, maxr2, maxl2, minr1;
+        int l1, l2, m1 = -1, m2 = 1, r1, r2;
         if (gx * gy >= 0) {
             m = 1; l1 = -1; r2 = 1; minl1 = -3; maxr2 = 3; l2 = 1; r1 = -1; maxl2 = 4; minr1 = -4;
         } else {
             m = -1; l1 = -1; r2 = 1; minl1 = -4; maxr2 = 4; l2 = 1; r1 = -1; maxl2 = 3; minr1 = -3;
         }
 
-        if (gyDominant) {
-            while (l1 > minl1 && Math.abs(Gy[y + l1][x - 1]) >= Math.abs(Gy[y + l1 - 1][x - 1])) l1--;
-            while (l2 < maxl2 && Math.abs(Gy[y + l2][x - 1]) >= Math.abs(Gy[y + l2 + 1][x - 1])) l2++;
-            while (m1 > -4    && Math.abs(Gy[y + m1][x])     >= Math.abs(Gy[y + m1 - 1][x])) m1--;
-            while (m2 < 4     && Math.abs(Gy[y + m2][x])     >= Math.abs(Gy[y + m2 + 1][x])) m2++;
-            while (r1 > minr1 && Math.abs(Gy[y + r1][x + 1]) >= Math.abs(Gy[y + r1 - 1][x + 1])) r1--;
-            while (r2 < maxr2 && Math.abs(Gy[y + r2][x + 1]) >= Math.abs(Gy[y + r2 + 1][x + 1])) r2++;
-        } else {
-            while (l1 > minl1 && Math.abs(Gx[y - 1][x + l1]) >= Math.abs(Gx[y - 1][x + l1 - 1])) l1--;
-            while (l2 < maxl2 && Math.abs(Gx[y - 1][x + l2]) >= Math.abs(Gx[y - 1][x + l2 + 1])) l2++;
-            while (m1 > -4    && Math.abs(Gx[y][x + m1])     >= Math.abs(Gx[y][x + m1 - 1])) m1--;
-            while (m2 < 4     && Math.abs(Gx[y][x + m2])     >= Math.abs(Gx[y][x + m2 + 1])) m2++;
-            while (r1 > minr1 && Math.abs(Gx[y + 1][x + r1]) >= Math.abs(Gx[y + 1][x + r1 - 1])) r1--;
-            while (r2 < maxr2 && Math.abs(Gx[y + 1][x + r2]) >= Math.abs(Gx[y + 1][x + r2 + 1])) r2++;
-        }
+        while (l1 > minl1 && Math.abs(at(Gm, x, y, -1, l1, dom)) >= Math.abs(at(Gm, x, y, -1, l1 - 1, dom))) l1--;
+        while (l2 < maxl2 && Math.abs(at(Gm, x, y, -1, l2, dom)) >= Math.abs(at(Gm, x, y, -1, l2 + 1, dom))) l2++;
+        while (m1 > -4 && Math.abs(at(Gm, x, y, 0, m1, dom)) >= Math.abs(at(Gm, x, y, 0, m1 - 1, dom))) m1--;
+        while (m2 < 4 && Math.abs(at(Gm, x, y, 0, m2, dom)) >= Math.abs(at(Gm, x, y, 0, m2 + 1, dom))) m2++;
+        while (r1 > minr1 && Math.abs(at(Gm, x, y, 1, r1, dom)) >= Math.abs(at(Gm, x, y, 1, r1 - 1, dom))) r1--;
+        while (r2 < maxr2 && Math.abs(at(Gm, x, y, 1, r2, dom)) >= Math.abs(at(Gm, x, y, 1, r2 + 1, dom))) r2++;
 
+        // Synthetic-patch window: fixed BEFORE the nearby-edge correction
+        // (in finalDetectorIterN.m, 'window' is built before uBorder/dBorder).
+        final int wl1 = l1, wl2 = l2, wm1 = m1, wm2 = m2, wr1 = r1, wr2 = r2;
+
+        // ---- intensities A and B ----
         double AA, BB;
-        if (gyDominant) {
-            if (m > 0) { AA = (G.getf(x, y + m2) + G.getf(x + 1, y + r2)) / 2.0; BB = (G.getf(x - 1, y + l1) + G.getf(x, y + m1)) / 2.0; } 
-            else       { AA = (G.getf(x - 1, y + l2) + G.getf(x, y + m2)) / 2.0; BB = (G.getf(x, y + m1) + G.getf(x + 1, y + r1)) / 2.0; }
+        if (m > 0) {
+            AA = (at(G, x, y, 0, m2, dom) + at(G, x, y, 1, r2, dom)) / 2.0;
+            BB = (at(G, x, y, -1, l1, dom) + at(G, x, y, 0, m1, dom)) / 2.0;
         } else {
-            if (m > 0) { AA = (G.getf(x + m2, y) + G.getf(x + r2, y + 1)) / 2.0; BB = (G.getf(x + l1, y - 1) + G.getf(x + m1, y)) / 2.0; } 
-            else       { AA = (G.getf(x + l2, y - 1) + G.getf(x + m2, y)) / 2.0; BB = (G.getf(x + m1, y) + G.getf(x + r1, y + 1)) / 2.0; }
+            AA = (at(G, x, y, -1, l2, dom) + at(G, x, y, 0, m2, dom)) / 2.0;
+            BB = (at(G, x, y, 0, m1, dom) + at(G, x, y, 1, r1, dom)) / 2.0;
         }
 
-        boolean uBorder = false;
-        boolean dBorder = false;
+        // ---- very close second edge (section 5.2) ----
+        boolean uBorder = false, dBorder = false;
+        final double[][] T = ctx.gradClose ? Gm : G;
+        final double central = Math.abs(T[y][x]) / 4.0;
+        final double half = ctx.threshold / 2.0;
+        if (m1 > -4) {
+            double p = Math.abs(at(T, x, y, 0, m1 - 2, dom));
+            if (p > central && p > half) uBorder = true;
+        }
+        if (m2 < 4) {
+            double p = Math.abs(at(T, x, y, 0, m2 + 2, dom));
+            if (p > central && p > half) dBorder = true;
+        }
+
         double SL = 0, SM = 0, SR = 0;
-        double gradCentral = Math.abs(G.getf(x, y) / 4.0);
-
-        if (gyDominant) {
-            if (m1 > -4) { double p = Math.abs(G.getf(x, y + m1 - 2)); if (p > gradCentral && p > threshold / 2.0) uBorder = true; }
-            if (m2 < 4)  { double p = Math.abs(G.getf(x, y + m2 + 2)); if (p > gradCentral && p > threshold / 2.0) dBorder = true; }
-        } else {
-            if (m1 > -4) { double p = Math.abs(G.getf(x + m1 - 2, y)); if (p > gradCentral && p > threshold / 2.0) uBorder = true; }
-            if (m2 < 4)  { double p = Math.abs(G.getf(x + m2 + 2, y)); if (p > gradCentral && p > threshold / 2.0) dBorder = true; }
-        }
 
         if (uBorder || dBorder) {
-            if (gyDominant) {
-                double[][] rimvt = new double[11][5];
-                for (int dy = -5; dy <= 5; dy++) for (int dx = -2; dx <= 2; dx++) rimvt[dy + 5][dx + 2] = F.getf(x + dx, y + dy);
+            // intermediate subimage F' (11 x 5, in k x c coordinates)
+            double[][] rim = new double[11][5];
+            for (int k = -5; k <= 5; k++)
+                for (int c = -2; c <= 2; c++)
+                    rim[k + 5][c + 2] = at(F, x, y, c, k, dom);
 
-                if (uBorder) {
-                    int p = (m > 0) ? 1 : 0;
-                    if (m > 0) BB = (F.getf(x, y + m1) + F.getf(x - 1, y + l1)) / 2.0; else BB = (F.getf(x, y + m1) + F.getf(x + 1, y + r1)) / 2.0;
-                    int ll = (Gy[y + l1 + p][x - 2] * gy > 0) ? (l1 + p - 1) : (l1 + p);
-                    int rr = (Gy[y + r1 + 1 - p][x + 2] * gy > 0) ? (r1 - p) : (r1 + 1 - p);
-                    for (int r = 0; r <= ll + 5; r++) rimvt[r][0] = BB; for (int r = 0; r <= l1 + 5; r++) rimvt[r][1] = BB;
-                    for (int r = 0; r <= m1 + 5; r++) rimvt[r][2] = BB; for (int r = 0; r <= r1 + 5; r++) rimvt[r][3] = BB;
-                    for (int r = 0; r <= rr + 5; r++) rimvt[r][4] = BB;
-                    l1 = -3 + m; m1 = -3; r1 = -3 - m;
-                }
-                if (dBorder) {
-                    int p = (m > 0) ? 1 : 0;
-                    if (m > 0) AA = (F.getf(x, y + m2) + F.getf(x + 1, y + r2)) / 2.0; else AA = (F.getf(x, y + m2) + F.getf(x - 1, y + l2)) / 2.0;
-                    int ll = (Gy[y + l2 + p - 1][x - 2] * gy > 0) ? (l2 + p) : (l2 + p - 1);
-                    int rr = (Gy[y + r2 - p][x + 2] * gy > 0) ? (r2 + 1 - p) : (r2 - p);
-                    for (int r = ll + 5; r <= 10; r++) rimvt[r][0] = AA; for (int r = l2 + 5; r <= 10; r++) rimvt[r][1] = AA;
-                    for (int r = m2 + 5; r <= 10; r++) rimvt[r][2] = AA; for (int r = r2 + 5; r <= 10; r++) rimvt[r][3] = AA;
-                    for (int r = rr + 5; r <= 10; r++) rimvt[r][4] = AA;
-                    l2 = 3 + m; m2 = 3; r2 = 3 - m;
-                }
-                double[][] rimv2 = new double[9][3];
-                for(int r = 0; r < 9; r++) for(int c = 0; c < 3; c++) {
-                    double sum = 0; for(int dy = 0; dy <= 2; dy++) for(int dx = 0; dx <= 2; dx++) sum += rimvt[r + dy][c + dx];
-                    rimv2[r][c] = sum / 9.0;
-                }
-                for (int n = l1 + 4; n <= l2 + 4; n++) SL += rimv2[n][0];
-                for (int n = m1 + 4; n <= m2 + 4; n++) SM += rimv2[n][1];
-                for (int n = r1 + 4; n <= r2 + 4; n++) SR += rimv2[n][2];
-            } else {
-                double[][] rimvt = new double[5][11];
-                for (int dy = -2; dy <= 2; dy++) for (int dx = -5; dx <= 5; dx++) rimvt[dy + 2][dx + 5] = F.getf(x + dx, y + dy);
-                
-                if (uBorder) {
-                    int p = (m > 0) ? 1 : 0;
-                    if (m > 0) BB = (F.getf(x + m1, y) + F.getf(x + l1, y - 1)) / 2.0; else BB = (F.getf(x + m1, y) + F.getf(x + r1, y + 1)) / 2.0;
-                    int ll = (Gx[y - 2][x + l1 + p] * gx > 0) ? (l1 + p - 1) : (l1 + p);
-                    int rr = (Gx[y + 2][x + r1 + 1 - p] * gx > 0) ? (r1 - p) : (r1 + 1 - p);
-                    for (int c = 0; c <= ll + 5; c++) rimvt[0][c] = BB; for (int c = 0; c <= l1 + 5; c++) rimvt[1][c] = BB;
-                    for (int c = 0; c <= m1 + 5; c++) rimvt[2][c] = BB; for (int c = 0; c <= r1 + 5; c++) rimvt[3][c] = BB;
-                    for (int c = 0; c <= rr + 5; c++) rimvt[4][c] = BB;
-                    l1 = -3 + m; m1 = -3; r1 = -3 - m;
-                }
-                if (dBorder) {
-                    int p = (m > 0) ? 1 : 0;
-                    if (m > 0) AA = (F.getf(x + m2, y) + F.getf(x + r2, y + 1)) / 2.0; else AA = (F.getf(x + m2, y) + F.getf(x + l2, y - 1)) / 2.0;
-                    int ll = (Gx[y - 2][x + l2 + p - 1] * gx > 0) ? (l2 + p) : (l2 + p - 1);
-                    int rr = (Gx[y + 2][x + r2 - p] * gx > 0) ? (r2 + 1 - p) : (r2 - p);
-                    for (int c = ll + 5; c <= 10; c++) rimvt[0][c] = AA; for (int c = l2 + 5; c <= 10; c++) rimvt[1][c] = AA;
-                    for (int c = m2 + 5; c <= 10; c++) rimvt[2][c] = AA; for (int c = r2 + 5; c <= 10; c++) rimvt[3][c] = AA;
-                    for (int c = rr + 5; c <= 10; c++) rimvt[4][c] = AA;
-                    l2 = 3 + m; m2 = 3; r2 = 3 - m;
-                }
-                double[][] rimv2 = new double[3][9];
-                for(int r = 0; r < 3; r++) for(int c = 0; c < 9; c++) {
-                    double sum = 0; for(int dy = 0; dy <= 2; dy++) for(int dx = 0; dx <= 2; dx++) sum += rimvt[r + dy][c + dx];
-                    rimv2[r][c] = sum / 9.0;
-                }
-                for (int n = l1 + 4; n <= l2 + 4; n++) SL += rimv2[0][n];
-                for (int n = m1 + 4; n <= m2 + 4; n++) SM += rimv2[1][n];
-                for (int n = r1 + 4; n <= r2 + 4; n++) SR += rimv2[2][n];
+            if (uBorder) {
+                final int p = (m > 0) ? 1 : 0;
+                if (m > 0) BB = (at(F, x, y, 0, m1, dom) + at(F, x, y, -1, l1, dom)) / 2.0;
+                else       BB = (at(F, x, y, 0, m1, dom) + at(F, x, y, 1, r1, dom)) / 2.0;
+                int ll = (at(Gm, x, y, -2, l1 + p, dom) * gm > 0) ? (l1 + p - 1) : (l1 + p);
+                int rr = (at(Gm, x, y, 2, r1 + 1 - p, dom) * gm > 0) ? (r1 - p) : (r1 + 1 - p);
+                fillFromStart(rim, 0, ll, BB);
+                fillFromStart(rim, 1, l1, BB);
+                fillFromStart(rim, 2, m1, BB);
+                fillFromStart(rim, 3, r1, BB);
+                fillFromStart(rim, 4, rr, BB);
+                l1 = -3 + m; m1 = -3; r1 = -3 - m;
             }
+            if (dBorder) {
+                final int p = (m > 0) ? 1 : 0;
+                if (m > 0) AA = (at(F, x, y, 0, m2, dom) + at(F, x, y, 1, r2, dom)) / 2.0;
+                else       AA = (at(F, x, y, 0, m2, dom) + at(F, x, y, -1, l2, dom)) / 2.0;
+                int ll = (at(Gm, x, y, -2, l2 + p - 1, dom) * gm > 0) ? (l2 + p) : (l2 + p - 1);
+                int rr = (at(Gm, x, y, 2, r2 - p, dom) * gm > 0) ? (r2 + 1 - p) : (r2 - p);
+                fillToEnd(rim, 0, ll, AA);
+                fillToEnd(rim, 1, l2, AA);
+                fillToEnd(rim, 2, m2, AA);
+                fillToEnd(rim, 3, r2, AA);
+                fillToEnd(rim, 4, rr, AA);
+                l2 = 3 + m; m2 = 3; r2 = 3 - m;
+            }
+
+            // 3x3 smoothing of F' -> G' (9 x 3)
+            double[][] g2 = new double[9][3];
+            for (int kk = 0; kk < 9; kk++) {
+                for (int cc = 0; cc < 3; cc++) {
+                    double sum = 0;
+                    for (int dk = 0; dk <= 2; dk++)
+                        for (int dc = 0; dc <= 2; dc++)
+                            sum += rim[kk + dk][cc + dc];
+                    g2[kk][cc] = sum / 9.0;
+                }
+            }
+            for (int n = l1 + 4; n <= l2 + 4; n++) SL += g2[n][0];
+            for (int n = m1 + 4; n <= m2 + 4; n++) SM += g2[n][1];
+            for (int n = r1 + 4; n <= r2 + 4; n++) SR += g2[n][2];
         } else {
-            if (gyDominant) {
-                for (int n = l1; n <= l2; n++) SL += G.getf(x - 1, y + n);
-                for (int n = m1; n <= m2; n++) SM += G.getf(x, y + n);
-                for (int n = r1; n <= r2; n++) SR += G.getf(x + 1, y + n);
-            } else {
-                for (int n = l1; n <= l2; n++) SL += G.getf(x + n, y - 1);
-                for (int n = m1; n <= m2; n++) SM += G.getf(x + n, y);
-                for (int n = r1; n <= r2; n++) SR += G.getf(x + n, y + 1);
-            }
+            for (int n = l1; n <= l2; n++) SL += at(G, x, y, -1, n, dom);
+            for (int n = m1; n <= m2; n++) SM += at(G, x, y, 0, n, dom);
+            for (int n = r1; n <= r2; n++) SR += at(G, x, y, 1, n, dom);
         }
 
-        double den = 2 * (AA - BB);
-        if (Math.abs(den) < 1e-6) return;
+        // ---- parabola coefficients (eq. 20) ----
+        final double den = 2.0 * (AA - BB);
+        if (den == 0.0) return;
 
-        double c = 0;
-        if (order == 2) c = (SL + SR - 2 * SM + AA * (2 * m2 - l2 - r2) - BB * (2 * m1 - l1 - r1)) / den;
-        
-        double a = (2 * SM - AA * (1 + 2 * m2) - BB * (1 - 2 * m1)) / den - w * c;
-        if (Math.abs(a) > 1.0) return;
-        
-        double b = (SR - SL + AA * (l2 - r2) - BB * (l1 - r1)) / den;
+        double c = 0.0;
+        if (ctx.order == 2) {
+            c = (SL + SR - 2 * SM + AA * (2 * m2 - l2 - r2) - BB * (2 * m1 - l1 - r1)) / den;
+        }
+        final double a = (2 * SM - AA * (1 + 2 * m2) - BB * (1 - 2 * m1)) / den - W * c;
+        if (!(Math.abs(a) <= MAX_VALID_OFFSET)) return;   // also discards NaN
+        final double b = (SR - SL + AA * (l2 - r2) - BB * (l1 - r1)) / den;
 
-        double s = Math.signum(AA - BB);
-        double nx = gyDominant ? (s / Math.sqrt(1 + b * b) * b) : (s / Math.sqrt(1 + b * b));
-        double ny = gyDominant ? (s / Math.sqrt(1 + b * b)) : (s / Math.sqrt(1 + b * b) * b);
+        final double sgn = Math.signum(AA - BB);
+        final double inv = sgn / Math.sqrt(1 + b * b);
         double curvature = 2 * c / Math.pow(1 + b * b, 1.5);
-        if (gyDominant && gy < 0) curvature = -curvature;
-        if (!gyDominant && gx < 0) curvature = -curvature;
+        if (gm < 0) curvature = -curvature;
 
         EdgePixel ep = new EdgePixel();
-        ep.x = gyDominant ? x : x - a;
-        ep.y = gyDominant ? y - a : y;
-        ep.nx = nx; ep.ny = ny;
+        if (dom) {
+            ep.x = x;
+            ep.y = y - a;
+            ep.nx = inv * b;
+            ep.ny = inv;
+        } else {
+            ep.x = x - a;
+            ep.y = y;
+            ep.nx = inv;
+            ep.ny = inv * b;
+        }
         ep.curvature = curvature;
-        ep.i0 = Math.min(AA, BB); ep.i1 = Math.max(AA, BB);
-        edges.add(ep);
+        ep.i0 = Math.min(AA, BB);
+        ep.i1 = Math.max(AA, BB);
+        ctx.edges.add(ep);
 
-        synthesizeLocalPatch(ep, x, y, l1, l2, m1, m2, r1, r2, restored, counter, gyDominant);
+        if (legacyPatchWindow) {
+            synthesizePatch(ctx, ep, x, y, dom, l1, l2, m1, m2, r1, r2);
+        } else {
+            synthesizePatch(ctx, ep, x, y, dom, wl1, wl2, wm1, wm2, wr1, wr2);
+        }
     }
-    private static void synthesizeLocalPatch(
-            EdgePixel ep, int cx, int cy,
-            int l1, int l2, int m1, int m2, int r1, int r2,
-            FloatProcessor restored,
-            FloatProcessor counter,
-            boolean gyDominant
-    ) {
-        double R = Math.abs(1.0 / ep.curvature);
-        if (R > 10000.0) R = 10000.0;
-        if (R < 4.5) R = 4.5;
 
-        double s;
-        double innerIntensity, outerIntensity;
+    /** rim[0..lim+5][col] = v  (rows k = -5 .. lim). */
+    private static void fillFromStart(double[][] rim, int col, int lim, double v) {
+        int end = Math.min(lim + 5, rim.length - 1);
+        for (int r = 0; r <= end; r++) rim[r][col] = v;
+    }
+
+    /** rim[lim+5..10][col] = v  (rows k = lim .. 5). */
+    private static void fillToEnd(double[][] rim, int col, int lim, double v) {
+        int start = Math.max(lim + 5, 0);
+        for (int r = start; r < rim.length; r++) rim[r][col] = v;
+    }
+
+    // ------------------------------------------------------------------
+    // Restoration: 9x3 synthetic patch of a circular edge (section 6)
+    // ------------------------------------------------------------------
+
+    private static void synthesizePatch(Context ctx, EdgePixel ep, int cx, int cy, boolean dom,
+                                        int l1, int l2, int m1, int m2, int r1, int r2) {
+        double radius = Math.abs(1.0 / ep.curvature);      // Infinity if curvature == 0
+        if (radius > R_MAX) radius = R_MAX;
+        if (radius < R_MIN) radius = R_MIN;
+
+        final double sgn, inner, outer;
         if (ep.curvature > 0) {
-            s = -1;
-            innerIntensity = Math.min(ep.i0, ep.i1);
-            outerIntensity = Math.max(ep.i0, ep.i1);
+            sgn = -1;
+            inner = Math.min(ep.i0, ep.i1);
+            outer = Math.max(ep.i0, ep.i1);
         } else {
-            s = 1;
-            innerIntensity = Math.max(ep.i0, ep.i1);
-            outerIntensity = Math.min(ep.i0, ep.i1);
+            sgn = 1;
+            inner = Math.max(ep.i0, ep.i1);
+            outer = Math.min(ep.i0, ep.i1);
         }
 
-        double centerX = ep.x + s * R * ep.nx;
-        double centerY = ep.y + s * R * ep.ny;
+        final double centerX = ep.x + sgn * radius * ep.nx;
+        final double centerY = ep.y + sgn * radius * ep.ny;
 
-        int gridResol = 50;
-        double step = 1.0 / gridResol;
-        double startOffset = -0.5 + step / 2.0;
+        for (int c = -1; c <= 1; c++) {
+            final int k1, k2;
+            final double weight;
+            if (c == -1)     { k1 = l1; k2 = l2; weight = 1.0; }
+            else if (c == 0) { k1 = m1; k2 = m2; weight = WEIGHT_MIDDLE; }
+            else             { k1 = r1; k2 = r2; weight = 1.0; }
 
-        int w = restored.getWidth();
-        int h = restored.getHeight();
+            for (int k = k1; k <= k2; k++) {
+                final int px = dom ? cx + c : cx + k;
+                final int py = dom ? cy + k : cy + c;
+                if (px < 0 || py < 0 || px >= ctx.w || py >= ctx.h) continue;
 
-        if (gyDominant) {
-            for (int dx = -1; dx <= 1; dx++) {
-                int px = cx + dx;
-                int startY, endY;
-                double weight;
-
-                if (dx == -1) { startY = l1; endY = l2; weight = 1.0; }
-                else if (dx == 0) { startY = m1; endY = m2; weight = 100.0; }
-                else { startY = r1; endY = r2; weight = 1.0; }
-
-                for (int dy = startY; dy <= endY; dy++) {
-                    int py = cy + dy;
-                    if (px < 0 || py < 0 || px >= w || py >= h) continue;
-
-                    double val = calculatePartialArea(px, py, centerX, centerY, R, innerIntensity, outerIntensity, gridResol, step, startOffset);
-
-                    restored.setf(px, py, restored.getf(px, py) + (float) (val * weight));
-                    counter.setf(px, py, counter.getf(px, py) + (float) weight);
-                }
-            }
-        } else {
-            for (int dy = -1; dy <= 1; dy++) {
-                int py = cy + dy;
-                int startX, endX;
-                double weight;
-
-                if (dy == -1) { startX = l1; endX = l2; weight = 1.0; }
-                else if (dy == 0) { startX = m1; endX = m2; weight = 100.0; }
-                else { startX = r1; endX = r2; weight = 1.0; }
-
-                for (int dx = startX; dx <= endX; dx++) {
-                    int px = cx + dx;
-                    if (px < 0 || py < 0 || px >= w || py >= h) continue;
-
-                    double val = calculatePartialArea(px, py, centerX, centerY, R, innerIntensity, outerIntensity, gridResol, step, startOffset);
-
-                    restored.setf(px, py, restored.getf(px, py) + (float) (val * weight));
-                    counter.setf(px, py, counter.getf(px, py) + (float) weight);
-                }
+                double val = partialAreaValue(px, py, centerX, centerY, radius, inner, outer);
+                ctx.acc[py][px] += val * weight;
+                ctx.cnt[py][px] += weight;
             }
         }
     }
-    private static double calculatePartialArea(
-            int px, int py,
-            double cx, double cy, double R,
-            double inInt, double outInt,
-            int resol, double step, double startOffset
-    ) {
-        double sum = 0;
-        double R2 = R * R;
-        
-        for (int i = 0; i < resol; i++) {
-            double sy = py + startOffset + i * step;
-            double dy = sy - cy;
-            double dy2 = dy * dy;
-            
-            for (int j = 0; j < resol; j++) {
-                double sx = px + startOffset + j * step;
-                double dx = sx - cx;
-                
-                if (dx * dx + dy2 <= R2) {
-                    sum += inInt;
-                } else {
-                    sum += outInt;
-                }
+
+    /**
+     * Intensity of pixel (px,py) covering [px-0.5,px+0.5] x [py-0.5,py+0.5] for a
+     * disc of radius R: 'inner' inside, 'outer' outside, proportional to the area in the
+     * edge pixel. Pixels entirely inside/outside are resolved by geometry (exact result);
+     * only the pixels cut by the circle use GRID x GRID sampling (midpoints).
+     */
+    private static double partialAreaValue(int px, int py, double cx, double cy, double radius,
+                                           double inner, double outer) {
+        final double dx0 = px - cx, dy0 = py - cy;
+        final double dist = Math.sqrt(dx0 * dx0 + dy0 * dy0);
+        if (dist + HALF_DIAGONAL <= radius) return inner;
+        if (dist - HALF_DIAGONAL >= radius) return outer;
+
+        final double r2 = radius * radius;
+        final double step = 1.0 / GRID;
+        final double start = -0.5 + step / 2.0;
+        int inside = 0;
+        for (int i = 0; i < GRID; i++) {
+            final double dy = (py + start + i * step) - cy;
+            final double dy2 = dy * dy;
+            for (int j = 0; j < GRID; j++) {
+                final double dx = (px + start + j * step) - cx;
+                if (dx * dx + dy2 <= r2) inside++;
             }
         }
-        return sum / (resol * resol);
+        final double frac = inside / (double) (GRID * GRID);
+        return outer + (inner - outer) * frac;
     }
-    public Point2D refine(ImageProcessor ip,
-            double x0, double y0,
-            double nx, double ny) {
-
-double[] profile = sampleProfile(ip, x0, y0, nx, ny);
-
-WindowBounds bounds = computeDynamicWindow(profile);
-
-return fitPAE(profile, bounds, x0, y0, nx, ny);
-}
-    private double[] sampleProfile(ImageProcessor ip,
-            double x0, double y0,
-            double nx, double ny) {
-
-int Smax = 6;
-int length = 2 * Smax + 1;
-
-double[] profile = new double[length];
-
-for (int i = -Smax; i <= Smax; i++) {
-
-double x = x0 + i * nx;
-double y = y0 + i * ny;
-
-profile[i + Smax] = ip.getInterpolatedValue(x, y);
-}
-
-return profile;
-}
-    private WindowBounds computeDynamicWindow(double[] profile) {
-
-        int n = profile.length;
-
-        double[] grad = new double[n - 1];
-
-        for (int i = 0; i < n - 1; i++) {
-            grad[i] = profile[i + 1] - profile[i];
-        }
-
-        int idxMax = 0;
-        double maxVal = 0;
-
-        for (int i = 0; i < grad.length; i++) {
-            double val = Math.abs(grad[i]);
-            if (val > maxVal) {
-                maxVal = val;
-                idxMax = i;
-            }
-        }
-
-        double alpha = 0.2;
-        double threshold = alpha * maxVal;
-
-        int left = idxMax;
-        int right = idxMax;
-
-        while (left > 0 && Math.abs(grad[left]) > threshold) {
-            left--;
-        }
-        while (right < grad.length - 1 &&
-               Math.abs(grad[right]) > threshold) {
-            right++;
-        }
-
-        return new WindowBounds(left, right + 1);
-    }
-    private Point2D fitPAE(double[] profile,
-            WindowBounds bounds,
-            double x0, double y0,
-            double nx, double ny) {
-
-int start = bounds.start;
-int end = bounds.end;
-
-double delta = solveSubpixelOffset(profile, start, end);
-
-double xRef = x0 + delta * nx;
-double yRef = y0 + delta * ny;
-
-return new Point2D.Double(xRef, yRef);
-}
-    private static class WindowBounds {
-        int start;
-        int end;
-
-        WindowBounds(int s, int e) {
-            this.start = s;
-            this.end = e;
-        }
-    }
-
-    private double solveSubpixelOffset(double[] profile,
-            int start,
-            int end) {
-
-int n = profile.length;
-double[] grad = new double[n - 1];
-
-for (int i = 0; i < n - 1; i++) {
-grad[i] = profile[i + 1] - profile[i];
-}
-
-int idxMax = start;
-double maxVal = Math.abs(grad[start]);
-
-for (int i = start; i < end; i++) {
-double val = Math.abs(grad[i]);
-if (val > maxVal) {
-maxVal = val;
-idxMax = i;
-}
-}
-
-if (idxMax <= 0 || idxMax >= grad.length - 1) {
-return 0.0;
-}
-
-double g1 = grad[idxMax - 1];
-double g2 = grad[idxMax];
-double g3 = grad[idxMax + 1];
-
-double denom = (g1 - 2*g2 + g3);
-
-if (Math.abs(denom) < 1e-10) {
-return 0.0;
-}
-
-double delta = 0.5 * (g1 - g3) / denom;
-
-int centerIndex = profile.length / 2;
-
-double offset = (idxMax + delta) - centerIndex;
-
-return offset;
-}
-    public static Result detectAndRestoreIterative(
-            ImageProcessor ip,
-            double threshold,
-            int order,
-            int iterations
-    ) {
-        FloatProcessor currentImage = (FloatProcessor) ip.convertToFloat();
-        Result finalResult = null;
-
-        for (int iter = 0; iter < iterations; iter++) {
-            
-            finalResult = detectAndRestore(currentImage, threshold, order);
-            
-            currentImage = finalResult.restoredImage;
-        }
-
-        return finalResult;
-    }
-
 }

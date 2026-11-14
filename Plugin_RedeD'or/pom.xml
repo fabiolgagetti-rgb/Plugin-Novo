@@ -72,8 +72,8 @@
     </issueManagement>
 
     <properties>
-        <package-name>br.unifesp.fisicamedica</package-name>
-        <main-class>br.unifesp.fisicamedica.DetectabilidadePlugin</main-class>
+        <package-name>br.rededor.fisicamedica</package-name>
+        <main-class>br.rededor.fisicamedica.DetectabilidadePlugin</main-class>
 
         <license.licenseName>MIT License</license.licenseName>
         <license.copyrightOwners>UNIFESP</license.copyrightOwners>
@@ -121,6 +121,12 @@
             <artifactId>commons-math3</artifactId>
             <version>3.6.1</version>
         </dependency>
+        <!-- Savitzky-Golay smoothing, usado pelo painel de Modulacao de Corrente (TMC) -->
+        <dependency>
+            <groupId>io.vacco.savitzky-golay</groupId>
+            <artifactId>savitzky-golay</artifactId>
+            <version>1.0.1</version>
+        </dependency>
          <dependency>
             <groupId>commons-io</groupId>
             <artifactId>commons-io</artifactId>
@@ -157,9 +163,45 @@
             <artifactId>maven-compiler-plugin</artifactId>
             <version>3.11.0</version>
             <configuration>
-                <source>1.8</source>
-                <target>1.8</target>
+                <release>8</release>
+                <!--
+                    Habilita explicitamente o annotation processing do SciJava,
+                    que gera META-INF/json/org.scijava.plugin.Plugin (indice de
+                    @Plugin). Esse indice e necessario para que Services (como o
+                    AutoStartService, que abre o plugin na inicializacao) sejam
+                    instanciados no boot do ImageJ.
+                -->
+                <annotationProcessors>
+                    <annotationProcessor>org.scijava.annotations.AnnotationProcessor</annotationProcessor>
+                </annotationProcessors>
             </configuration>
+        </plugin>
+
+        <!--
+            O pom-scijava impoe a regra enforceBytecodeVersion (alvo JDK 8). A
+            biblioteca savitzky-golay 1.0.1 (usada pelo painel de Modulacao de
+            Corrente) traz SgFilter.class compilado para JDK 11. Ignoramos essa
+            classe especifica na regra para permitir o uso da dependencia sem
+            relaxar a verificacao para o restante do projeto.
+        -->
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-enforcer-plugin</artifactId>
+            <executions>
+                <execution>
+                    <id>enforce-rules</id>
+                    <configuration>
+                        <rules>
+                            <enforceBytecodeVersion>
+                                <maxJdkVersion>1.8</maxJdkVersion>
+                                <ignoreClasses>
+                                    <ignoreClass>io.vacco.savitzkygolay.*</ignoreClass>
+                                </ignoreClasses>
+                            </enforceBytecodeVersion>
+                        </rules>
+                    </configuration>
+                </execution>
+            </executions>
         </plugin>
 
         <plugin>
@@ -199,7 +241,7 @@
     <artifactId>exec-maven-plugin</artifactId>
     <version>3.1.0</version>
     <configuration>
-        <mainClass>br.unifesp.fisicamedica.Tester</mainClass>
+        <mainClass>br.rededor.fisicamedica.Tester</mainClass>
         <classpathScope>test</classpathScope>
     </configuration>
 </plugin>

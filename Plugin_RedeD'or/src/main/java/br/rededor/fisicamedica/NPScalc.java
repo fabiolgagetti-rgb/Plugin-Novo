@@ -61,6 +61,32 @@ public class NPScalc {
         return integratedNPS;
     }
 
+    /**
+     * Element-wise average of a list of equal-sized 2D power spectra.
+     * Used by the validation harnesses (ported from the Detectabilidade repo).
+     * @param spectra list of size x size spectra
+     * @param size    side length of each square spectrum
+     * @return the averaged spectrum (all zeros if the list is null/empty)
+     */
+    public static double[][] averageSpectra(java.util.List<double[][]> spectra, int size) {
+        double[][] avg = new double[size][size];
+        if (spectra == null || spectra.isEmpty()) return avg;
+        for (double[][] ps : spectra) {
+            for (int y = 0; y < size; y++) {
+                for (int x = 0; x < size; x++) {
+                    avg[y][x] += ps[y][x];
+                }
+            }
+        }
+        int n = spectra.size();
+        for (int y = 0; y < size; y++) {
+            for (int x = 0; x < size; x++) {
+                avg[y][x] /= n;
+            }
+        }
+        return avg;
+    }
+
     public static double[] radialProfile(double[][] powerSpectrum, Calibration cal, double[] radialFreq) {
         int w = powerSpectrum[0].length;
         int h = powerSpectrum.length;

@@ -422,4 +422,31 @@ public class TtfPanel {
     public static Calibration getLastCal() { return lastCal; }
     public static List<Integer> getLastInsertIDs() { return accumulatedTaskIDs; }
     public static TtfCalc.mtfResult getLastTtfResult() { return accumulatedTtfResult; }
+
+    /**
+     * Publica no painel TTF um resultado de TTF calculado externamente (ex.:
+     * pelo fluxo automatico da aba "CQ ACR"). Acumula as tasks, reconstroi o
+     * painel de tarefas e atualiza o grafico, mantendo os resultados visiveis
+     * no painel TTF. Retorna o mapeamento insertId-original -> novo taskId.
+     */
+    public static java.util.Map<Integer, Integer> publishExternalResult(TtfCalc.mtfResult newResult, Calibration cal) {
+        java.util.Map<Integer, Integer> idMap = new java.util.HashMap<>();
+        if (newResult == null || newResult.ttfs == null || newResult.ttfs.isEmpty()) return idMap;
+        if (cal != null) lastCal = cal;
+
+        for (Integer oldId : newResult.ttfs.keySet()) {
+            int newId = nextTaskId++;
+            accumulatedTtfResult.ttfs.put(newId, newResult.ttfs.get(oldId));
+            accumulatedTtfResult.freqs.put(newId, newResult.freqs.get(oldId));
+            accumulatedTtfResult.lsfs.put(newId, newResult.lsfs.get(oldId));
+            accumulatedTtfResult.esfs.put(newId, newResult.esfs.get(oldId));
+            accumulatedTtfResult.contrasts.put(newId, newResult.contrasts.get(oldId));
+            accumulatedTtfResult.I0.put(newId, newResult.I0.get(oldId));
+            accumulatedTtfResult.I1.put(newId, newResult.I1.get(oldId));
+            accumulatedTaskIDs.add(newId);
+            idMap.put(oldId, newId);
+        }
+        if (taskChecksPanel != null) rebuildTaskPanel();
+        return idMap;
+    }
 }
