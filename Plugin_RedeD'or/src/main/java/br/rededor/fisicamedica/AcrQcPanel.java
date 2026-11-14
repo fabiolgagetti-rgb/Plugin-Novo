@@ -1,127 +1,282 @@
 package br.rededor.fisicamedica;
 
+import java.awt.BasicStroke;
 import java.awt.BorderLayout;
+import java.awt.Color;
 import java.awt.Dimension;
+import java.awt.FlowLayout;
 import java.awt.Font;
+import java.awt.Graphics;
+import java.awt.Graphics2D;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
+import java.awt.GridLayout;
 import java.awt.Insets;
+import java.awt.RenderingHints;
 import java.awt.Toolkit;
 import java.awt.datatransfer.StringSelection;
 import java.io.File;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
 
 import javax.swing.BorderFactory;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
 import javax.swing.JButton;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
-import javax.swing.JTextArea;
+import javax.swing.JTable;
+import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
+import javax.swing.SwingWorker;
+import javax.swing.table.DefaultTableModel;
 
 import ij.IJ;
+import ij.ImagePlus;
+import ij.gui.Roi;
+import ij.plugin.frame.RoiManager;
 
 /**
- * Aba "CQ ACR": controle de qualidade automatizado do phantom ACR de TC.
+ * Aba estruturada de Controle de Qualidade do phantom ACR de TC.
  *
- * - Exibe as principais informacoes DICOM da serie ativa (nome, protocolo,
- *   kernel, espessura de corte, kV, mA, tempo de rotacao, pitch).
- * - Botao "Analisar" que executa os testes ANVISA (espessura de corte,
- *   exatidao do numero de CT, uniformidade, ruido, CNR de baixo contraste e
- *   exatidao de distancia entre pinos) e, em paralelo, o pipeline de qualidade
- *   de imagem (TTF, NPS, NPWE/d').
- * - Os resultados de TTF/NPS/d' sao PUBLICADOS em seus respectivos paineis
- *   (abas TTF, NPS e NPWE Model Observer); esta aba apenas resume o d'.
- * - Mostra os resultados e uma linha unica (TAB-separada, decimal com virgula)
- *   pronta para colar no Excel.
+ * Os cálculos pesados são executados fora da EDT. Depois da análise, os
+ * resultados são apresentados em cards, tabelas e um gráfico compacto de
+ * uniformidade. TTF, NPS e NPWE continuam detalhados em suas abas próprias.
+ * Todas as ROIs efetivamente usadas são publicadas no ROI Manager, com nome e
+ * posição de fatia, sem apagar ROIs que o usuário já possua.
  */
 public class AcrQcPanel {
 
+    private static final Font VALUE_FONT = new Font("SansSerif", Font.BOLD, 15);
+    private static final Font DETAIL_FONT = new Font("SansSerif", Font.PLAIN, 12);
+
     private static JLabel lblPatient, lblProtocol, lblKernel, lblThickness, lblKvp, lblMa,
             lblRotTime, lblPitch;
-    private static JTextArea resultsArea;
-    private static JTextArea excelArea;
-    private static JButton analyzeBtn, refreshBtn, copyBtn;
+    private static JLabel statusLabel, geometryLabel, roiCountLabel;
+    private static JLabel cardThickness, cardDistance, cardNoise, cardCnr, cardDPrime, cardAuc;
+    private static JLabel thicknessDetail, cnrDetail, distanceDetail, imageQualityDetail;
+    private static DefaultTableModel ctModel, uniformityModel;
+    private static UniformityChart uniformityChart;
+    private static JButton analyzeBtn, refreshBtn, copyBtn, showRoisBtn;
+    private static String lastExcelLine = "";
 
     public static JPanel create() {
         JPanel root = new JPanel(new BorderLayout(8, 8));
         root.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
 
-        // ---------------- Cabecalho: informacoes DICOM ----------------
+        JPanel header = createHeader();
+        JPanel content = new JPanel();
+        content.setLayout(new BoxLayout(content, BoxLayout.Y_AXIS));
+        content.add(createSummarySection());
+        content.add(Box.createVerticalStrut(8));
+        content.add(createCtSection());
+        content.add(Box.createVerticalStrut(8));
+        content.add(createUniformitySection());
+        content.add(Box.createVerticalStrut(8));
+        content.add(createThicknessAndCnrSection());
+        content.add(Box.createVerticalStrut(8));
+        content.add(createDistanceSection());
+        content.add(Box.createVerticalStrut(8));
+        content.add(createImageQualitySection());
+        content.add(Box.createVerticalGlue());
+
+        JScrollPane scroll = new JScrollPane(content);
+        scroll.setBorder(null);
+        scroll.getVerticalScrollBar().setUnitIncrement(16);
+
+        root.add(header, BorderLayout.NORTH);
+        root.add(scroll, BorderLayout.CENTER);
+        root.setPreferredSize(new Dimension(900, 650));
+
+        refreshBtn.addActionListener(e -> refreshDicomInfo());
+        analyzeBtn.addActionListener(e -> runAnalysis());
+        copyBtn.addActionListener(e -> copyExcelLine());
+        showRoisBtn.addActionListener(e -> showRoiManager());
+
+        resetResults();
+        refreshDicomInfo();
+        return root;
+    }
+
+    private static JPanel createHeader() {
+        JPanel wrapper = new JPanel(new BorderLayout(4, 4));
         JPanel header = new JPanel(new GridBagLayout());
-        header.setBorder(BorderFactory.createTitledBorder("Informacoes da aquisicao (DICOM)"));
+        header.setBorder(BorderFactory.createTitledBorder("Informações da aquisição (DICOM)"));
         GridBagConstraints g = new GridBagConstraints();
         g.insets = new Insets(3, 6, 3, 6);
         g.anchor = GridBagConstraints.WEST;
         g.fill = GridBagConstraints.HORIZONTAL;
 
-        lblPatient   = valueLabel();
-        lblProtocol  = valueLabel();
-        lblKernel    = valueLabel();
+        lblPatient = valueLabel();
+        lblProtocol = valueLabel();
+        lblKernel = valueLabel();
         lblThickness = valueLabel();
-        lblKvp       = valueLabel();
-        lblMa        = valueLabel();
-        lblRotTime   = valueLabel();
-        lblPitch     = valueLabel();
+        lblKvp = valueLabel();
+        lblMa = valueLabel();
+        lblRotTime = valueLabel();
+        lblPitch = valueLabel();
 
         int row = 0;
-        row = addHeaderRow(header, g, row, "Paciente/Serie:", lblPatient, "Protocolo:", lblProtocol);
-        row = addHeaderRow(header, g, row, "Kernel:", lblKernel, "Espessura de corte:", lblThickness);
+        row = addHeaderRow(header, g, row, "Paciente / série:", lblPatient, "Protocolo:", lblProtocol);
+        row = addHeaderRow(header, g, row, "Kernel:", lblKernel, "Espessura:", lblThickness);
         row = addHeaderRow(header, g, row, "kVp:", lblKvp, "mA:", lblMa);
-        row = addHeaderRow(header, g, row, "Tempo de rotacao:", lblRotTime, "Pitch:", lblPitch);
+        addHeaderRow(header, g, row, "Tempo de rotação:", lblRotTime, "Pitch:", lblPitch);
 
-        refreshBtn = new JButton("Atualizar infos");
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
+        refreshBtn = new JButton("Atualizar informações");
         analyzeBtn = new JButton("Analisar");
         analyzeBtn.setFont(analyzeBtn.getFont().deriveFont(Font.BOLD));
-        JPanel btnRow = new JPanel();
-        btnRow.add(refreshBtn);
-        btnRow.add(analyzeBtn);
+        copyBtn = new JButton("Copiar linha Excel");
+        showRoisBtn = new JButton("Mostrar ROI Manager");
+        actions.add(refreshBtn);
+        actions.add(analyzeBtn);
+        actions.add(copyBtn);
+        actions.add(showRoisBtn);
 
-        g.gridx = 0; g.gridy = row; g.gridwidth = 4; g.anchor = GridBagConstraints.CENTER;
-        g.fill = GridBagConstraints.NONE;
-        header.add(btnRow, g);
+        statusLabel = new JLabel("Selecione uma série ACR e clique em Analisar.");
+        statusLabel.setBorder(BorderFactory.createEmptyBorder(0, 8, 2, 4));
+        roiCountLabel = new JLabel("ROIs: -", SwingConstants.RIGHT);
+        roiCountLabel.setBorder(BorderFactory.createEmptyBorder(0, 4, 2, 8));
 
-        // ---------------- Resultados ----------------
-        resultsArea = new JTextArea(22, 48);
-        resultsArea.setEditable(false);
-        resultsArea.setFont(new Font("Monospaced", Font.PLAIN, 12));
-        JScrollPane resultsScroll = new JScrollPane(resultsArea);
-        resultsScroll.setBorder(BorderFactory.createTitledBorder("Resultados do Controle de Qualidade"));
+        JPanel statusRow = new JPanel(new BorderLayout());
+        statusRow.add(statusLabel, BorderLayout.CENTER);
+        statusRow.add(roiCountLabel, BorderLayout.EAST);
 
-        // ---------------- Linha para Excel ----------------
-        excelArea = new JTextArea(3, 48);
-        excelArea.setEditable(false);
-        excelArea.setLineWrap(true);
-        excelArea.setFont(new Font("Monospaced", Font.PLAIN, 11));
-        JScrollPane excelScroll = new JScrollPane(excelArea);
+        wrapper.add(header, BorderLayout.NORTH);
+        wrapper.add(actions, BorderLayout.CENTER);
+        wrapper.add(statusRow, BorderLayout.SOUTH);
+        return wrapper;
+    }
 
-        copyBtn = new JButton("Copiar linha para o Excel");
-        JPanel excelPanel = new JPanel(new BorderLayout(4, 4));
-        excelPanel.setBorder(BorderFactory.createTitledBorder("Linha para o relatorio (Excel) \u2014 TAB-separada, decimal com virgula"));
-        excelPanel.add(excelScroll, BorderLayout.CENTER);
-        excelPanel.add(copyBtn, BorderLayout.SOUTH);
+    private static JPanel createSummarySection() {
+        JPanel section = section("Resumo");
+        section.setLayout(new BorderLayout(6, 6));
+        geometryLabel = new JLabel("Fatias analisadas: -");
+        geometryLabel.setBorder(BorderFactory.createEmptyBorder(0, 4, 2, 4));
 
-        JPanel bottom = new JPanel(new BorderLayout(6, 6));
-        bottom.add(resultsScroll, BorderLayout.CENTER);
-        bottom.add(excelPanel, BorderLayout.SOUTH);
+        JPanel cards = new JPanel(new GridLayout(2, 3, 8, 8));
+        cardThickness = addCard(cards, "Espessura medida");
+        cardDistance = addCard(cards, "Distância dos pinos");
+        cardNoise = addCard(cards, "Ruído central");
+        cardCnr = addCard(cards, "CNR baixo contraste");
+        cardDPrime = addCard(cards, "Índice d′ (NPWE)");
+        cardAuc = addCard(cards, "AUC");
 
-        root.add(header, BorderLayout.NORTH);
-        root.add(bottom, BorderLayout.CENTER);
-        root.setPreferredSize(new Dimension(820, 600));
+        section.add(geometryLabel, BorderLayout.NORTH);
+        section.add(cards, BorderLayout.CENTER);
+        return section;
+    }
 
-        // ---------------- Acoes ----------------
-        refreshBtn.addActionListener(e -> refreshDicomInfo());
-        analyzeBtn.addActionListener(e -> runAnalysis());
-        copyBtn.addActionListener(e -> {
-            String txt = excelArea.getText();
-            if (txt != null && !txt.isEmpty()) {
-                Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(txt), null);
-                IJ.showStatus("Linha copiada para a area de transferencia.");
+    private static JLabel addCard(JPanel parent, String title) {
+        JPanel card = new JPanel(new BorderLayout(2, 2));
+        card.setBackground(new Color(248, 249, 251));
+        card.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(new Color(205, 210, 218)),
+                BorderFactory.createEmptyBorder(7, 9, 7, 9)));
+        JLabel caption = new JLabel(title);
+        caption.setFont(caption.getFont().deriveFont(Font.PLAIN, 11f));
+        JLabel value = new JLabel("-");
+        value.setFont(VALUE_FONT);
+        card.add(caption, BorderLayout.NORTH);
+        card.add(value, BorderLayout.CENTER);
+        parent.add(card);
+        return value;
+    }
+
+    private static JPanel createCtSection() {
+        JPanel section = section("Exatidão do número de CT");
+        section.setLayout(new BorderLayout());
+        ctModel = tableModel("Material", "Média (HU)", "SD (HU)", "Fatia");
+        JTable table = styledTable(ctModel);
+        table.setPreferredScrollableViewportSize(new Dimension(760, 112));
+        section.add(new JScrollPane(table), BorderLayout.CENTER);
+        return section;
+    }
+
+    private static JPanel createUniformitySection() {
+        JPanel section = section("Uniformidade e ruído");
+        section.setLayout(new BorderLayout(8, 4));
+        uniformityModel = tableModel("Posição", "Média (HU)", "SD (HU)", "Δ centro (HU)", "Fatia");
+        JTable table = styledTable(uniformityModel);
+        table.setPreferredScrollableViewportSize(new Dimension(555, 105));
+        uniformityChart = new UniformityChart();
+        uniformityChart.setPreferredSize(new Dimension(245, 155));
+        section.add(new JScrollPane(table), BorderLayout.CENTER);
+        section.add(uniformityChart, BorderLayout.EAST);
+        return section;
+    }
+
+    private static JPanel createThicknessAndCnrSection() {
+        JPanel row = new JPanel(new GridLayout(1, 2, 8, 0));
+        row.setAlignmentX(JPanel.LEFT_ALIGNMENT);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 190));
+        JPanel thickness = section("Espessura de corte");
+        thickness.setLayout(new BorderLayout());
+        thicknessDetail = detailLabel();
+        thickness.add(thicknessDetail, BorderLayout.CENTER);
+
+        JPanel cnr = section("Baixo contraste / CNR");
+        cnr.setLayout(new BorderLayout());
+        cnrDetail = detailLabel();
+        cnr.add(cnrDetail, BorderLayout.CENTER);
+
+        row.add(thickness);
+        row.add(cnr);
+        return row;
+    }
+
+    private static JPanel createDistanceSection() {
+        JPanel section = section("Exatidão da distância entre os pinos");
+        section.setLayout(new BorderLayout());
+        distanceDetail = detailLabel();
+        section.add(distanceDetail, BorderLayout.CENTER);
+        return section;
+    }
+
+    private static JPanel createImageQualitySection() {
+        JPanel section = section("Qualidade de imagem (detalhes nas abas TTF, NPS e NPWE)");
+        section.setLayout(new BorderLayout());
+        imageQualityDetail = detailLabel();
+        section.add(imageQualityDetail, BorderLayout.CENTER);
+        return section;
+    }
+
+    private static JPanel section(String title) {
+        JPanel p = new JPanel();
+        p.setAlignmentX(JPanel.LEFT_ALIGNMENT);
+        p.setMaximumSize(new Dimension(Integer.MAX_VALUE, 340));
+        p.setBorder(BorderFactory.createTitledBorder(title));
+        return p;
+    }
+
+    private static JLabel detailLabel() {
+        JLabel label = new JLabel("-");
+        label.setFont(DETAIL_FONT);
+        label.setVerticalAlignment(SwingConstants.TOP);
+        label.setBorder(BorderFactory.createEmptyBorder(5, 8, 7, 8));
+        return label;
+    }
+
+    private static DefaultTableModel tableModel(String... columns) {
+        return new DefaultTableModel(columns, 0) {
+            @Override
+            public boolean isCellEditable(int row, int column) {
+                return false;
             }
-        });
+        };
+    }
 
-        refreshDicomInfo();
-        return root;
+    private static JTable styledTable(DefaultTableModel model) {
+        JTable table = new JTable(model);
+        table.setFillsViewportHeight(true);
+        table.setRowHeight(21);
+        table.getTableHeader().setReorderingAllowed(false);
+        return table;
     }
 
     private static JLabel valueLabel() {
@@ -146,40 +301,31 @@ public class AcrQcPanel {
         return l;
     }
 
-    // ------------------------------------------------------------------
-    // Infos DICOM
-    // ------------------------------------------------------------------
-
     private static void refreshDicomInfo() {
         SeriesData sd = ImageOpener.getActiveSeriesData();
         if (sd == null || sd.getFiles().isEmpty()) {
-            setInfo("(nenhuma serie ativa)", "-", "-", "-", "-", "-", "-", "-");
+            setInfo("(nenhuma série ativa)", "-", "-", "-", "-", "-", "-", "-");
             return;
         }
         File f = sd.getFiles().get(0);
         String meta = sd.getMetadata(f);
-
-        String patient  = sd.getSeriesDescription();
+        String patient = orDash(tag(meta, "0010,0010"));
+        String series = orDash(sd.getSeriesDescription());
         String protocol = tag(meta, "0018,1030");
-        String kernel   = tag(meta, "0018,1210");
-        String thick    = tag(meta, "0018,0050");
-        String kvp      = tag(meta, "0018,0060");
-        String ma       = tag(meta, "0018,1151");
-        if (isBlank(ma)) ma = tag(meta, "0018,1152"); // Exposure (mAs) como fallback
-        // Tempo de rotacao: Revolution Time (0018,9305) ou Exposure Time (0018,1150)
-        String rot      = tag(meta, "0018,9305");
+        String kernel = tag(meta, "0018,1210");
+        String thick = tag(meta, "0018,0050");
+        String kvp = tag(meta, "0018,0060");
+        String ma = tag(meta, "0018,1151");
+        if (isBlank(ma)) ma = tag(meta, "0018,1152");
+        String rot = tag(meta, "0018,9305");
         if (isBlank(rot)) rot = tag(meta, "0018,1150");
-        // Pitch: Spiral Pitch Factor (0018,9311)
-        String pitch    = tag(meta, "0018,9311");
+        String pitch = tag(meta, "0018,9311");
 
-        setInfo(patient,
-                orDash(protocol),
-                orDash(kernel),
+        setInfo(patient + " / " + series,
+                orDash(protocol), orDash(kernel),
                 isBlank(thick) ? "-" : thick + " mm",
-                isBlank(kvp) ? "-" : kvp + " kV",
-                orDash(ma),
-                isBlank(rot) ? "-" : rot + " ms/s",
-                orDash(pitch));
+                isBlank(kvp) ? "-" : kvp + " kV", orDash(ma),
+                isBlank(rot) ? "-" : rot, orDash(pitch));
     }
 
     private static void setInfo(String patient, String protocol, String kernel, String thickness,
@@ -198,55 +344,115 @@ public class AcrQcPanel {
         return DicomProcessor.getTag(meta, t);
     }
 
-    private static boolean isBlank(String s) { return s == null || s.trim().isEmpty(); }
-    private static String orDash(String s) { return isBlank(s) ? "-" : s.trim(); }
+    private static boolean isBlank(String s) {
+        return s == null || s.trim().isEmpty();
+    }
 
-    // ------------------------------------------------------------------
-    // Analise
-    // ------------------------------------------------------------------
+    private static String orDash(String s) {
+        return isBlank(s) ? "-" : s.trim();
+    }
 
     private static void runAnalysis() {
-        final SeriesData sd = ImageOpener.getActiveSeriesData();
-        if (sd == null || sd.getFiles().isEmpty()) {
+        final SeriesData series = ImageOpener.getActiveSeriesData();
+        final ImagePlus image = ImageOpener.getActiveImagePlus();
+        if (series == null || series.getFiles().isEmpty()) {
             JOptionPane.showMessageDialog(null,
-                    "Nenhuma serie ativa. Abra as imagens do phantom ACR no File Browser (duplo-clique na serie).",
+                    "Nenhuma série ativa. Abra o phantom ACR no navegador de arquivos.",
                     "CQ ACR", JOptionPane.WARNING_MESSAGE);
             return;
         }
 
-        analyzeBtn.setEnabled(false);
-        resultsArea.setText("Analisando... (localizando modulos, medindo CQ, calculando TTF/NPS/d')\n");
-        excelArea.setText("");
-
-        // Captura os parametros do eye filter na EDT antes de ir para o background.
+        setBusy(true);
+        status("Analisando módulos, testes de CQ, TTF, NPS e d′...", new Color(35, 80, 145));
         final double[] eyeFilter = DetectabilityIndexPanel.getEyeFilterParams();
 
-        new Thread(() -> {
-            try {
-                AcrQcAnalyser.AcrQcResult qc = AcrQcAnalyser.analyze(sd);
-                AcrQcAnalyser.ImageQualityResult iq = AcrQcAnalyser.runImageQualityPipeline(sd, eyeFilter);
-
-                SwingUtilities.invokeLater(() -> {
-                    publishImageQuality(iq);
-                    resultsArea.setText(formatResults(qc, iq));
-                    excelArea.setText(qc.found ? qc.excelLine : "");
-                    analyzeBtn.setEnabled(true);
-                });
-            } catch (Exception ex) {
-                final String msg = ex.getMessage();
-                SwingUtilities.invokeLater(() -> {
-                    resultsArea.setText("Erro durante a analise: " + msg);
-                    analyzeBtn.setEnabled(true);
-                });
-                IJ.handleException(ex);
+        new SwingWorker<AnalysisBundle, Void>() {
+            @Override
+            protected AnalysisBundle doInBackground() {
+                AcrQcAnalyser.AcrQcResult qc = AcrQcAnalyser.analyze(series);
+                AcrQcAnalyser.ImageQualityResult iq = AcrQcAnalyser.runImageQualityPipeline(series, eyeFilter);
+                return new AnalysisBundle(qc, iq);
             }
-        }).start();
+
+            @Override
+            protected void done() {
+                try {
+                    AnalysisBundle result = get();
+                    updateResults(result.qc, result.iq);
+                    lastExcelLine = result.qc != null && result.qc.found ? result.qc.excelLine : "";
+                    copyBtn.setEnabled(!lastExcelLine.isEmpty());
+
+                    if (result.qc == null || !result.qc.found) {
+                        roiCountLabel.setText("ROIs não publicadas");
+                        status("Falha na análise de CQ: "
+                                + (result.qc == null ? "resultado ausente" : result.qc.message),
+                                new Color(170, 35, 35));
+                        return;
+                    }
+
+                    boolean sameSeries = ImageOpener.getActiveSeriesData() == series;
+                    boolean sameImage = image != null && ImageOpener.getActiveImagePlus() == image;
+                    if (sameSeries && sameImage) {
+                        publishImageQuality(result.iq);
+                        int roiCount = publishRois(image, result.qc, result.iq);
+                        roiCountLabel.setText("ROIs publicadas: " + roiCount);
+                        status("Análise concluída. Resultados e ROIs associados à série ativa.", new Color(25, 110, 55));
+                    } else {
+                        roiCountLabel.setText("ROIs não publicadas");
+                        status("Análise concluída, mas a série ativa mudou. ROIs e curvas não foram publicadas.",
+                                new Color(175, 95, 15));
+                    }
+                } catch (Exception ex) {
+                    status("Erro durante a análise: " + safeMessage(ex), new Color(170, 35, 35));
+                    IJ.handleException(ex);
+                } finally {
+                    setBusy(false);
+                }
+            }
+        }.execute();
     }
 
-    /** Publica TTF/NPS/d' nos paineis respectivos (mantendo os resultados la). */
+    private static int publishRois(ImagePlus image, AcrQcAnalyser.AcrQcResult qc,
+                                   AcrQcAnalyser.ImageQualityResult iq) {
+        List<AcrQcAnalyser.RoiRecord> records = new ArrayList<>();
+        if (qc != null) records.addAll(qc.rois);
+        if (iq != null) records.addAll(iq.rois);
+        if (records.isEmpty()) return 0;
+
+        RoiManager manager = RoiManager.getInstance();
+        if (manager == null) manager = new RoiManager();
+        String runId = new SimpleDateFormat("HHmmss", Locale.US).format(new Date());
+        int added = 0;
+        for (AcrQcAnalyser.RoiRecord record : records) {
+            if (record == null || record.roi == null || record.slice < 1) continue;
+            Roi roi = (Roi) record.roi.clone();
+            roi.setName(String.format(Locale.US, "ACR %s | %s | z=%03d",
+                    runId, record.name, record.slice));
+            roi.setStrokeColor(colorFor(record.test));
+            roi.setStrokeWidth(record.roi instanceof ij.gui.Line ? 2.0 : 1.0);
+            roi.setPosition(record.slice);
+            roi.setImage(image);
+            manager.add(image, roi, -1);
+            added++;
+        }
+        manager.setVisible(true);
+        manager.runCommand("Show All");
+        return added;
+    }
+
+    private static Color colorFor(String test) {
+        if ("CT".equals(test)) return new Color(230, 125, 30);
+        if ("Uniformidade".equals(test)) return new Color(35, 110, 210);
+        if ("CNR".equals(test)) return new Color(35, 150, 75);
+        if ("Espessura".equals(test)) return new Color(180, 65, 180);
+        if ("Distancia".equals(test)) return new Color(235, 190, 30);
+        if ("NPS".equals(test)) return new Color(20, 165, 175);
+        if ("TTF".equals(test)) return new Color(205, 55, 55);
+        return Color.YELLOW;
+    }
+
     private static void publishImageQuality(AcrQcAnalyser.ImageQualityResult iq) {
         if (iq == null || !iq.ok) return;
-
         if (iq.ttf != null && iq.ttf.ttfs != null && !iq.ttf.ttfs.isEmpty()) {
             TtfPanel.publishExternalResult(iq.ttf, iq.cal);
         }
@@ -261,89 +467,266 @@ public class AcrQcPanel {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Formatacao dos resultados
-    // ------------------------------------------------------------------
-
-    private static String m(AcrQcAnalyser.Measure x) {
-        if (x == null || !x.valid) return "N/A";
-        return String.format(java.util.Locale.US, "%.2f +/- %.2f HU", x.mean, x.sd);
-    }
-
-    private static String d(double v, String unit) {
-        if (Double.isNaN(v)) return "N/A";
-        return String.format(java.util.Locale.US, "%.2f %s", v, unit).trim();
-    }
-
-    private static String formatResults(AcrQcAnalyser.AcrQcResult r, AcrQcAnalyser.ImageQualityResult iq) {
-        StringBuilder sb = new StringBuilder();
-        if (!r.found) {
-            sb.append("Falha na analise de CQ: ").append(r.message).append("\n");
-        } else {
-            sb.append("=== GEOMETRIA DETECTADA ===\n");
-            sb.append(String.format("Phantom: fatias %d a %d | Modulo 1 (centro): %d%n",
-                    r.phantomStart, r.phantomEnd, r.mod1Center));
-            sb.append(String.format("Fatia nº CT: %d | Uniformidade: %d | Baixo contraste: %d%n%n",
-                    r.ctSlice, r.uniformitySlice, r.lowContrastSlice));
-
-            sb.append("=== ESPESSURA DE CORTE ===\n");
-            sb.append("Nominal (DICOM)   : ").append(d(r.sliceThicknessDicom, "mm")).append("\n");
-            sb.append("Medida (superior) : ").append(d(r.sliceThicknessTop, "mm")).append("\n");
-            sb.append("Medida (inferior) : ").append(d(r.sliceThicknessBottom, "mm")).append("\n");
-            if (r.sliceThicknessNote != null && !r.sliceThicknessNote.isEmpty()) {
-                sb.append("  (").append(r.sliceThicknessNote).append(")\n");
-            }
-            sb.append("\n");
-
-            sb.append("=== EXATIDAO DO NUMERO DE CT (fatia ").append(r.ctSlice).append(") ===\n");
-            sb.append("Agua          : ").append(m(r.water)).append("\n");
-            sb.append("Osso          : ").append(m(r.bone)).append("\n");
-            sb.append("Ar (interno)  : ").append(m(r.airIn)).append("\n");
-            sb.append("Ar (fundo)    : ").append(m(r.airOut)).append("\n");
-            sb.append("Polietileno   : ").append(m(r.poly)).append("\n");
-            sb.append("Acrilico      : ").append(m(r.acrylic)).append("\n\n");
-
-            sb.append("=== UNIFORMIDADE E RUIDO (fatia ").append(r.uniformitySlice).append(") ===\n");
-            sb.append("Centro        : ").append(m(r.uCenter)).append("\n");
-            sb.append("Topo (12h)    : ").append(m(r.uTop)).append("\n");
-            sb.append("Fundo (6h)    : ").append(m(r.uBottom)).append("\n");
-            sb.append("Esquerda (9h) : ").append(m(r.uLeft)).append("\n");
-            sb.append("Direita (3h)  : ").append(m(r.uRight)).append("\n");
-            sb.append("Maior dif. (centro-perif): ").append(d(r.maxUniformityDiff, "HU")).append("\n");
-            sb.append("Ruido (SD centro)        : ").append(d(r.noise, "HU")).append("\n\n");
-
-            sb.append("=== BAIXO CONTRASTE / CNR (fatia ").append(r.lowContrastSlice).append(") ===\n");
-            sb.append("Sinal (massa) : ").append(m(r.lcSignal)).append("\n");
-            sb.append("Fundo         : ").append(m(r.lcBackground)).append("\n");
-            sb.append("CNR           : ").append(d(r.cnr, "")).append("\n\n");
-
-            sb.append("=== EXATIDAO DE DISTANCIA (pinos de referencia, fatia ")
-              .append(r.pinSlice).append(") ===\n");
-            sb.append("Distancia medida : ").append(d(r.pinDistance, "mm"))
-              .append("  (par ").append(r.pinOrientation).append(")\n");
-            sb.append("  Par horizontal : ").append(d(r.pinDistanceH, "mm")).append("\n");
-            sb.append("  Par vertical   : ").append(d(r.pinDistanceV, "mm")).append("\n");
-            sb.append("  Marcadores     : ").append(r.pinMarkerCount).append("\n");
-            if (r.pinPhantomInverted) {
-                sb.append("  ** ATENCAO: phantom possivelmente invertido/rotacionado ")
-                  .append("(par alinhado na vertical em vez da horizontal) \u2014 verificar **\n");
-            }
-            sb.append("\n");
+    private static void updateResults(AcrQcAnalyser.AcrQcResult r,
+                                      AcrQcAnalyser.ImageQualityResult iq) {
+        resetResults();
+        if (r == null || !r.found) {
+            status("Falha na análise de CQ: " + (r == null ? "resultado ausente" : r.message),
+                    new Color(170, 35, 35));
+            return;
         }
 
-        sb.append("=== QUALIDADE DE IMAGEM (detalhes nos paineis TTF / NPS / NPWE) ===\n");
+        geometryLabel.setText(String.format(Locale.US,
+                "Phantom: fatias %d–%d  |  CT: %d  |  Uniformidade: %d  |  Baixo contraste: %d  |  Pinos: %d",
+                r.phantomStart, r.phantomEnd, r.ctSlice, r.uniformitySlice,
+                r.lowContrastSlice, r.pinSlice));
+
+        cardThickness.setText(d(mean(r.sliceThicknessTop, r.sliceThicknessBottom), "mm"));
+        cardDistance.setText(d(r.pinDistance, "mm"));
+        cardNoise.setText(d(r.noise, "HU"));
+        cardCnr.setText(d(r.cnr, ""));
+        cardDPrime.setText(iq != null ? d(iq.dPrime, "") : "N/A");
+        cardAuc.setText(iq != null ? d(iq.auc, "") : "N/A");
+
+        addCtRow(r.airIn, r.ctSlice);
+        addCtRow(r.poly, r.ctSlice);
+        addCtRow(r.water, r.ctSlice);
+        addCtRow(r.acrylic, r.ctSlice);
+        addCtRow(r.bone, r.ctSlice);
+        addCtRow(r.airOut, r.ctSlice);
+
+        addUniformityRow(r.uCenter, r.uCenter, r.uniformitySlice);
+        addUniformityRow(r.uTop, r.uCenter, r.uniformitySlice);
+        addUniformityRow(r.uRight, r.uCenter, r.uniformitySlice);
+        addUniformityRow(r.uBottom, r.uCenter, r.uniformitySlice);
+        addUniformityRow(r.uLeft, r.uCenter, r.uniformitySlice);
+        uniformityChart.setMeasurements(r.uCenter, r.uTop, r.uRight, r.uBottom, r.uLeft);
+
+        thicknessDetail.setText(html(
+                line("Nominal (DICOM)", d(r.sliceThicknessDicom, "mm")),
+                line("Superior", d(r.sliceThicknessTop, "mm")),
+                line("Inferior", d(r.sliceThicknessBottom, "mm")),
+                optionalLine("Observação", r.sliceThicknessNote)));
+
+        cnrDetail.setText(html(
+                line("Sinal", measurement(r.lcSignal)),
+                line("Fundo", measurement(r.lcBackground)),
+                line("CNR", d(r.cnr, "")),
+                line("Fatia", String.valueOf(r.lowContrastSlice))));
+
+        String inversion = r.pinPhantomInverted
+                ? "<font color='#b03030'><b>Verificar orientação do phantom</b></font>"
+                : "Orientação nominal";
+        distanceDetail.setText(html(
+                line("Distância escolhida", d(r.pinDistance, "mm")),
+                line("Par nominal", d(r.pinDistanceH, "mm")),
+                line("Par espelhado", d(r.pinDistanceV, "mm")),
+                line("Orientação", inversion),
+                optionalLine("Detalhes", r.pinNote)));
+
         if (iq != null && iq.ok) {
-            sb.append("TTF e NPS publicados nos respectivos paineis.\n");
-            sb.append("NPS: ").append(iq.npsSlicesUsed).append(" fatias uniformes, ROIs de 80 mm.\n");
-            sb.append(String.format(java.util.Locale.US,
-                    "d' (NPWE): %s | AUC: %s  [tarefa %.0f mm diam, %.0f HU]%n",
-                    Double.isNaN(iq.dPrime) ? "N/A" : String.format(java.util.Locale.US, "%.4f", iq.dPrime),
-                    Double.isNaN(iq.auc) ? "N/A" : String.format(java.util.Locale.US, "%.4f", iq.auc),
-                    iq.taskRadiusMm * 2, iq.taskContrastHU));
+            double varianceError = percentDifference(iq.npsVariance, iq.npsIntegrated);
+            imageQualityDetail.setText(html(
+                    line("TTF", iq.ttfSlicesUsed + " fatias; inserto selecionado "
+                            + (iq.lowestContrastInsertId < 0 ? "N/A" : iq.lowestContrastInsertId + 1)),
+                    line("NPS", String.format(Locale.US,
+                            "%d fatias / %d ROIs (%.0f mm; raio %.0f mm)",
+                            iq.npsSlicesUsed, iq.npsRoisUsed,
+                            iq.npsRoiSizeMm, iq.npsDistributionRadiusMm)),
+                    line("Variância / NPS integrada", String.format(Locale.US, "%.3f / %.3f (dif. %.2f%%)",
+                            iq.npsVariance, iq.npsIntegrated, varianceError)),
+                    line("Frequência pico / média", String.format(Locale.US, "%.3f / %.3f ciclos/mm",
+                            iq.npsPeakFreq, iq.npsMeanFreq)),
+                    line("NPWE", String.format(Locale.US, "d′ %.4f | AUC %.4f | tarefa %.0f mm, %.0f HU",
+                            iq.dPrime, iq.auc, iq.taskRadiusMm * 2, iq.taskContrastHU))));
         } else {
-            sb.append("Pipeline de qualidade de imagem: ")
-              .append(iq != null && !isBlank(iq.message) ? iq.message : "nao concluido").append("\n");
+            imageQualityDetail.setText("Pipeline de TTF/NPS/NPWE não concluído.");
         }
-        return sb.toString();
+    }
+
+    private static void addCtRow(AcrQcAnalyser.Measure m, int slice) {
+        ctModel.addRow(new Object[]{m == null ? "-" : m.label,
+                formatMeasureValue(m, true), formatMeasureValue(m, false), slice});
+    }
+
+    private static void addUniformityRow(AcrQcAnalyser.Measure m,
+                                         AcrQcAnalyser.Measure center, int slice) {
+        String diff = m != null && m.valid && center != null && center.valid
+                ? String.format(Locale.US, "%.2f", m.mean - center.mean) : "N/A";
+        uniformityModel.addRow(new Object[]{m == null ? "-" : m.label,
+                formatMeasureValue(m, true), formatMeasureValue(m, false), diff, slice});
+    }
+
+    private static String formatMeasureValue(AcrQcAnalyser.Measure m, boolean mean) {
+        if (m == null || !m.valid) return "N/A";
+        return String.format(Locale.US, "%.2f", mean ? m.mean : m.sd);
+    }
+
+    private static String measurement(AcrQcAnalyser.Measure m) {
+        if (m == null || !m.valid) return "N/A";
+        return String.format(Locale.US, "%.2f ± %.2f HU", m.mean, m.sd);
+    }
+
+    private static double mean(double a, double b) {
+        if (Double.isNaN(a) || Double.isNaN(b)) return Double.NaN;
+        return (a + b) / 2.0;
+    }
+
+    private static double percentDifference(double a, double b) {
+        if (Double.isNaN(a) || Double.isNaN(b) || a == 0) return Double.NaN;
+        return Math.abs(a - b) * 100.0 / Math.abs(a);
+    }
+
+    private static String d(double value, String unit) {
+        if (Double.isNaN(value) || Double.isInfinite(value)) return "N/A";
+        return String.format(Locale.US, "%.2f%s", value, unit.isEmpty() ? "" : " " + unit);
+    }
+
+    private static String html(String... rows) {
+        StringBuilder sb = new StringBuilder("<html><table cellpadding='2'>");
+        for (String row : rows) if (row != null && !row.isEmpty()) sb.append(row);
+        return sb.append("</table></html>").toString();
+    }
+
+    private static String line(String key, String value) {
+        return "<tr><td><b>" + key + ":</b></td><td>" + value + "</td></tr>";
+    }
+
+    private static String optionalLine(String key, String value) {
+        return isBlank(value) ? "" : line(key, value);
+    }
+
+    private static void resetResults() {
+        if (ctModel != null) ctModel.setRowCount(0);
+        if (uniformityModel != null) uniformityModel.setRowCount(0);
+        if (uniformityChart != null) uniformityChart.clear();
+        if (geometryLabel != null) geometryLabel.setText("Fatias analisadas: -");
+        setCard(cardThickness, "-");
+        setCard(cardDistance, "-");
+        setCard(cardNoise, "-");
+        setCard(cardCnr, "-");
+        setCard(cardDPrime, "-");
+        setCard(cardAuc, "-");
+        if (thicknessDetail != null) thicknessDetail.setText("-");
+        if (cnrDetail != null) cnrDetail.setText("-");
+        if (distanceDetail != null) distanceDetail.setText("-");
+        if (imageQualityDetail != null) imageQualityDetail.setText("-");
+        lastExcelLine = "";
+        if (copyBtn != null) copyBtn.setEnabled(false);
+    }
+
+    private static void setCard(JLabel label, String value) {
+        if (label != null) label.setText(value);
+    }
+
+    private static void setBusy(boolean busy) {
+        analyzeBtn.setEnabled(!busy);
+        refreshBtn.setEnabled(!busy);
+    }
+
+    private static void status(String text, Color color) {
+        statusLabel.setText(text);
+        statusLabel.setForeground(color);
+    }
+
+    private static void copyExcelLine() {
+        if (lastExcelLine.isEmpty()) return;
+        Toolkit.getDefaultToolkit().getSystemClipboard()
+                .setContents(new StringSelection(lastExcelLine), null);
+        status("Linha copiada para a área de transferência.", new Color(25, 110, 55));
+    }
+
+    private static void showRoiManager() {
+        RoiManager manager = RoiManager.getInstance();
+        if (manager == null) manager = new RoiManager();
+        manager.setVisible(true);
+    }
+
+    private static String safeMessage(Exception ex) {
+        Throwable cause = ex.getCause() == null ? ex : ex.getCause();
+        return cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage();
+    }
+
+    private static class AnalysisBundle {
+        final AcrQcAnalyser.AcrQcResult qc;
+        final AcrQcAnalyser.ImageQualityResult iq;
+
+        AnalysisBundle(AcrQcAnalyser.AcrQcResult qc, AcrQcAnalyser.ImageQualityResult iq) {
+            this.qc = qc;
+            this.iq = iq;
+        }
+    }
+
+    /** Gráfico simples das diferenças periféricas em relação ao centro. */
+    private static class UniformityChart extends JPanel {
+        private static final long serialVersionUID = 1L;
+        private final String[] labels = {"12h", "3h", "6h", "9h"};
+        private double[] values;
+
+        void setMeasurements(AcrQcAnalyser.Measure center, AcrQcAnalyser.Measure top,
+                             AcrQcAnalyser.Measure right, AcrQcAnalyser.Measure bottom,
+                             AcrQcAnalyser.Measure left) {
+            if (center == null || !center.valid) {
+                clear();
+                return;
+            }
+            AcrQcAnalyser.Measure[] peripheral = {top, right, bottom, left};
+            values = new double[4];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = peripheral[i] != null && peripheral[i].valid
+                        ? peripheral[i].mean - center.mean : Double.NaN;
+            }
+            repaint();
+        }
+
+        void clear() {
+            values = null;
+            repaint();
+        }
+
+        @Override
+        protected void paintComponent(Graphics graphics) {
+            super.paintComponent(graphics);
+            Graphics2D g = (Graphics2D) graphics.create();
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            int w = getWidth();
+            int h = getHeight();
+            int left = 30, right = 8, top = 20, bottom = 28;
+            int chartW = Math.max(1, w - left - right);
+            int chartH = Math.max(1, h - top - bottom);
+            int zeroY = top + chartH / 2;
+
+            g.setColor(new Color(85, 90, 100));
+            g.setStroke(new BasicStroke(1f));
+            g.drawLine(left, zeroY, left + chartW, zeroY);
+            g.drawString("Δ HU", 5, 14);
+
+            if (values == null) {
+                g.setColor(Color.GRAY);
+                g.drawString("Sem dados", left + 50, zeroY);
+                g.dispose();
+                return;
+            }
+
+            double maxAbs = 1.0;
+            for (double v : values) if (!Double.isNaN(v)) maxAbs = Math.max(maxAbs, Math.abs(v));
+            int slot = chartW / values.length;
+            int barW = Math.max(10, slot / 2);
+            for (int i = 0; i < values.length; i++) {
+                double v = values[i];
+                int x = left + i * slot + (slot - barW) / 2;
+                if (!Double.isNaN(v)) {
+                    int barH = (int) Math.round(Math.abs(v) / maxAbs * (chartH / 2.0 - 12));
+                    int y = v >= 0 ? zeroY - barH : zeroY;
+                    g.setColor(v >= 0 ? new Color(55, 125, 205) : new Color(75, 165, 135));
+                    g.fillRect(x, y, barW, barH);
+                    g.setColor(new Color(60, 65, 75));
+                    g.drawString(String.format(Locale.US, "%.1f", v), x - 2, v >= 0 ? y - 3 : y + barH + 12);
+                }
+                g.setColor(new Color(60, 65, 75));
+                g.drawString(labels[i], x, h - 7);
+            }
+            g.dispose();
+        }
     }
 }

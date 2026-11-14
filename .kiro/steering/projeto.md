@@ -80,3 +80,16 @@ projeto, reconciliar divergências de nomes de método que existem entre os repo
   `org.scijava.annotations.AnnotationProcessor` — sem isso, com `release 8` +
   JDK 17, o Maven nao roda o processor e o indice (e o autostart) nao e gerado.
 - Para desabilitar a abertura automatica, remover `AutoStartService.java`.
+
+## Auditoria visual das análises ACR
+- Toda ROI efetivamente usada por um teste ACR deve ser preservada como
+  `AcrQcAnalyser.RoiRecord`, com nome descritivo e posição global da fatia.
+- Isso inclui ROIs de número de CT, ar externo, uniformidade, CNR, rampas de
+  espessura, janelas/pontos/linha da distância, contornos TTF e ROIs NPS.
+- O analisador não deve manipular o `RoiManager`: a publicação ocorre em lote na
+  EDT pelo `AcrQcPanel`, após confirmar que a série e a imagem ativas não mudaram.
+- Não usar `RoiManager.reset()` no fluxo ACR. Preservar ROIs do usuário e nomear
+  cada execução com um identificador próprio.
+- A aba CQ ACR deve apresentar resultados em componentes Swing estruturados
+  (cards, tabelas e gráficos úteis), não em uma `JTextArea` monolítica. Os
+  gráficos completos de TTF e NPS permanecem apenas nas respectivas abas.

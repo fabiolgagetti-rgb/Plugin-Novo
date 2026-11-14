@@ -1,5 +1,6 @@
 package br.rededor.fisicamedica;
 
+import java.awt.Rectangle;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -7,7 +8,9 @@ import java.util.List;
 
 import ij.ImagePlus;
 import ij.ImageStack;
+import ij.gui.Line;
 import ij.gui.OvalRoi;
+import ij.gui.PointRoi;
 import ij.gui.PolygonRoi;
 import ij.gui.Roi;
 import ij.measure.Calibration;
@@ -43,6 +46,34 @@ public class AcrQcAnalyser {
     // ------------------------------------------------------------------
     // Estruturas de resultado
     // ------------------------------------------------------------------
+
+    /**
+     * ROI efetivamente usada por um teste. O analisador apenas coleta as ROIs;
+     * a interface as publica no ROI Manager, na EDT, depois que o processamento
+     * termina e a identidade da serie ativa e confirmada.
+     */
+    public static class RoiRecord {
+        public final Roi roi;
+        public final String name;
+        public final int slice;
+        public final String test;
+
+        public RoiRecord(Roi roi, String name, int slice, String test) {
+            this.roi = roi == null ? null : (Roi) roi.clone();
+            this.name = name;
+            this.slice = slice;
+            this.test = test;
+            if (this.roi != null) {
+                this.roi.setName(name);
+                this.roi.setPosition(slice);
+            }
+        }
+    }
+
+    private static void addRoiRecord(List<RoiRecord> records, Roi roi,
+                                     String name, int slice, String test) {
+        if (records != null && roi != null) records.add(new RoiRecord(roi, name, slice, test));
+    }
 
     /** Medida media +/- desvio padrao de uma regiao (HU). */
     public static class Measure {
@@ -108,6 +139,9 @@ public class AcrQcAnalyser {
         public String pinNote = "";
         public static final double PIN_DISTANCE_NOMINAL_MM = 100.0;
 
+        // ROIs dos testes convencionais, prontas para publicacao no ROI Manager.
+        public final List<RoiRecord> rois = new ArrayList<>();
+
         // Linha unica para colar no Excel (TAB-separada, decimal com virgula)
         public String excelLine = "";
     }
@@ -123,7 +157,6 @@ public class AcrQcAnalyser {
     private static final double CT_ROI_RADIUS_MM     = 8.0;   // raio do ROI de medida de HU dos materiais
     private static final double UNIF_ROI_RADIUS_MM   = 10.0;  // raio do ROI de uniformidade
     private static final double UNIF_PERIPHERAL_MM   = 80.0;  // distancia centro->periferico (uniformidade)
-    private static final double AIR_OUT_RADIUS_MM    = 25.0;  // raio do ROI de ar externo (fundo)
 
     // ------------------------------------------------------------------
     // Carregamento da serie em stack (com calibracao)
@@ -260,13 +293,16 @@ public class AcrQcAnalyser {
         return new double[]{sumX / count, sumY / count};
     }
 
-    private static Measure measureOval(ImageProcessor ip, Calibration cal, double cx, double cy,
-                                       double radiusPx, String label) {
-        OvalRoi roi = new OvalRoi(cx - radiusPx, cy - radiusPx, radiusPx * 2, radiusPx * 2);
+    private static Measure measureRoi(ImageProcessor ip, Calibration cal, Roi roi, String label) {
         ip.setRoi(roi);
-        ImageStatistics st = ImageStatistics.getStatistics(ip, Measurements.MEAN + Measurements.STD_DEV, cal);
+        ImageStatistics st = ImageStatistics.getStatistics(
+                ip, Measurements.MEAN + Measurements.STD_DEV, cal);
         ip.resetRoi();
         return new Measure(label, st.mean, st.stdDev);
+    }
+
+    private static OvalRoi ovalRoi(double cx, double cy, double radiusPx) {
+        return new OvalRoi(cx - radiusPx, cy - radiusPx, radiusPx * 2, radiusPx * 2);
     }
 
     // ------------------------------------------------------------------
@@ -510,7 +546,14 @@ public class AcrQcAnalyser {
     /** Inserto detectado: posicao, HU medio e desvio padrao (ROI reduzido). */
     private static class Insert {
         double cx, cy, hu, sd;
-        Insert(double cx, double cy, double hu, double sd) { this.cx = cx; this.cy = cy; this.hu = hu; this.sd = sd; }
+        Roi measurementRoi;
+        Insert(double cx, double cy, double hu, double sd, Roi measurementRoi) {
+            this.cx = cx;
+            this.cy = cy;
+            this.hu = hu;
+            this.sd = sd;
+            this.measurementRoi = measurementRoi;
+        }
     }
 
     /**
@@ -554,16 +597,25 @@ public class AcrQcAnalyser {
             r.poly    = new Measure("Polietileno",    poly.hu, poly.sd);
             r.acrylic = new Measure("Acrilico",       acr.hu,  acr.sd);
             r.bone    = new Measure("Osso",           bone.hu, bone.sd);
+            addRoiRecord(r.rois, air.measurementRoi, "CT | Ar interno", r.ctSlice, "CT");
+            addRoiRecord(r.rois, poly.measurementRoi, "CT | Polietileno", r.ctSlice, "CT");
+            addRoiRecord(r.rois, acr.measurementRoi, "CT | Acrilico", r.ctSlice, "CT");
+            addRoiRecord(r.rois, bone.measurementRoi, "CT | Osso", r.ctSlice, "CT");
         }
 
         // Agua: medida no centro do phantom nesta fatia (inserto de agua/fundo central).
         ImageProcessor ip = ls.stack.getProcessor(best.slice);
         double[] center = phantomCenter(ip, ls.cal);
         double rCt = CT_ROI_RADIUS_MM / ls.px;
-        r.water = measureOval(ip, ls.cal, center[0], center[1], rCt, "Agua");
+        OvalRoi waterRoi = ovalRoi(center[0], center[1], rCt);
+        r.water = measureRoi(ip, ls.cal, waterRoi, "Agua");
+        addRoiRecord(r.rois, waterRoi, "CT | Agua", r.ctSlice, "CT");
 
-        // Ar no fundo/externo: ROI fora do phantom (canto superior esquerdo).
+        // Ar no fundo/externo: janela superior, com filtro de HU aplicado no calculo.
         r.airOut = measureAirOutside(ip, ls.cal, ls.px);
+        int bandH = (int) Math.min(ip.getHeight() / 4, Math.round(40.0 / ls.px));
+        addRoiRecord(r.rois, new Roi(0, 0, ip.getWidth(), bandH),
+                "CT | Ar externo (janela filtrada -1050..-800 HU)", r.ctSlice, "CT");
     }
 
     private static class CtCandidate {
@@ -609,8 +661,9 @@ public class AcrQcAnalyser {
             double measRadiusPx = Math.min(detRadiusPx * 0.70, CT_ROI_RADIUS_MM / ls.px);
             if (measRadiusPx < 2) measRadiusPx = Math.max(2, detRadiusPx * 0.6);
 
-            Measure m = measureOval(ip, ls.cal, cx, cy, measRadiusPx, "insert");
-            inserts.add(new Insert(cx, cy, m.mean, m.sd));
+            OvalRoi measRoi = ovalRoi(cx, cy, measRadiusPx);
+            Measure m = measureRoi(ip, ls.cal, measRoi, "insert");
+            inserts.add(new Insert(cx, cy, m.mean, m.sd, measRoi));
             minHU = Math.min(minHU, m.mean);
             maxHU = Math.max(maxHU, m.mean);
         }
@@ -666,11 +719,23 @@ public class AcrQcAnalyser {
         double rUnif = UNIF_ROI_RADIUS_MM / ls.px;
         double dist = UNIF_PERIPHERAL_MM / ls.px;
 
-        r.uCenter = measureOval(ip, ls.cal, c[0], c[1], rUnif, "Centro");
-        r.uTop    = measureOval(ip, ls.cal, c[0], c[1] - dist, rUnif, "Topo (12h)");
-        r.uBottom = measureOval(ip, ls.cal, c[0], c[1] + dist, rUnif, "Fundo (6h)");
-        r.uLeft   = measureOval(ip, ls.cal, c[0] - dist, c[1], rUnif, "Esquerda (9h)");
-        r.uRight  = measureOval(ip, ls.cal, c[0] + dist, c[1], rUnif, "Direita (3h)");
+        OvalRoi centerRoi = ovalRoi(c[0], c[1], rUnif);
+        OvalRoi topRoi = ovalRoi(c[0], c[1] - dist, rUnif);
+        OvalRoi bottomRoi = ovalRoi(c[0], c[1] + dist, rUnif);
+        OvalRoi leftRoi = ovalRoi(c[0] - dist, c[1], rUnif);
+        OvalRoi rightRoi = ovalRoi(c[0] + dist, c[1], rUnif);
+
+        r.uCenter = measureRoi(ip, ls.cal, centerRoi, "Centro");
+        r.uTop    = measureRoi(ip, ls.cal, topRoi, "Topo (12h)");
+        r.uBottom = measureRoi(ip, ls.cal, bottomRoi, "Fundo (6h)");
+        r.uLeft   = measureRoi(ip, ls.cal, leftRoi, "Esquerda (9h)");
+        r.uRight  = measureRoi(ip, ls.cal, rightRoi, "Direita (3h)");
+
+        addRoiRecord(r.rois, centerRoi, "Uniformidade | Centro", slice, "Uniformidade");
+        addRoiRecord(r.rois, topRoi, "Uniformidade | Topo 12h", slice, "Uniformidade");
+        addRoiRecord(r.rois, bottomRoi, "Uniformidade | Fundo 6h", slice, "Uniformidade");
+        addRoiRecord(r.rois, leftRoi, "Uniformidade | Esquerda 9h", slice, "Uniformidade");
+        addRoiRecord(r.rois, rightRoi, "Uniformidade | Direita 3h", slice, "Uniformidade");
 
         r.noise = r.uCenter.sd;
 
@@ -697,8 +762,12 @@ public class AcrQcAnalyser {
         // do centro; medimos o fundo no centro e o sinal ~37-58mm acima.
         double signalDist = 58.0 / ls.px;
 
-        r.lcBackground = measureOval(ip, ls.cal, c[0], c[1], rCt, "Fundo");
-        r.lcSignal     = measureOval(ip, ls.cal, c[0], c[1] - signalDist, rCt, "Massa (sinal)");
+        OvalRoi backgroundRoi = ovalRoi(c[0], c[1], rCt);
+        OvalRoi signalRoi = ovalRoi(c[0], c[1] - signalDist, rCt);
+        r.lcBackground = measureRoi(ip, ls.cal, backgroundRoi, "Fundo");
+        r.lcSignal = measureRoi(ip, ls.cal, signalRoi, "Massa (sinal)");
+        addRoiRecord(r.rois, backgroundRoi, "CNR | Fundo", slice, "CNR");
+        addRoiRecord(r.rois, signalRoi, "CNR | Massa sinal", slice, "CNR");
 
         if (r.lcBackground.valid && r.lcSignal.valid && r.lcBackground.sd > 0) {
             r.cnr = Math.abs(r.lcSignal.mean - r.lcBackground.mean) / r.lcBackground.sd;
@@ -760,18 +829,26 @@ public class AcrQcAnalyser {
         double rI1Ymm = THK_REF_CENTER_Y_MM + (THK_REF_CENTER_Y_MM - (THK_S1_Y_MM + THK_RECT_H_MM));
         double yI = (rI1Ymm + offYmm) / ls.py;
 
-        double[] profS1 = rectColumnProfile(ip, ls.cal, xS1, yS, wPx, hPx);
-        double[] profS2 = rectColumnProfile(ip, ls.cal, xS2, yS, wPx, hPx);
-        double[] profI1 = rectColumnProfile(ip, ls.cal, xS1, yI, wPx, hPx);
-        double[] profI2 = rectColumnProfile(ip, ls.cal, xS2, yI, wPx, hPx);
+        Roi roiS1 = new Roi(xS1, yS, wPx, hPx);
+        Roi roiS2 = new Roi(xS2, yS, wPx, hPx);
+        Roi roiI1 = new Roi(xS1, yI, wPx, hPx);
+        Roi roiI2 = new Roi(xS2, yI, wPx, hPx);
+
+        double[] profS1 = rectColumnProfile(ip, ls.cal, roiS1.getBounds());
+        double[] profS2 = rectColumnProfile(ip, ls.cal, roiS2.getBounds());
+        double[] profI1 = rectColumnProfile(ip, ls.cal, roiI1.getBounds());
+        double[] profI2 = rectColumnProfile(ip, ls.cal, roiI2.getBounds());
+
+        addRoiRecord(r.rois, roiS1, "Espessura | Rampa superior 1", r.mod1Center, "Espessura");
+        addRoiRecord(r.rois, roiS2, "Espessura | Rampa superior 2", r.mod1Center, "Espessura");
+        addRoiRecord(r.rois, roiI1, "Espessura | Rampa inferior 1", r.mod1Center, "Espessura");
+        addRoiRecord(r.rois, roiI2, "Espessura | Rampa inferior 2", r.mod1Center, "Espessura");
 
         double maxS = Math.max(arrMax(profS1), arrMax(profS2));
-        double minS = Math.min(arrMin(profS1), arrMin(profS2));
         int pS1 = countPeaks(profS1, maxS, ls.py);
         int pS2 = countPeaks(profS2, maxS, ls.py);
 
         double maxI = Math.max(arrMax(profI1), arrMax(profI2));
-        double minI = Math.min(arrMin(profI1), arrMin(profI2));
         int pI1 = countPeaks(profI1, maxI, ls.py);
         int pI2 = countPeaks(profI2, maxI, ls.py);
 
@@ -784,12 +861,11 @@ public class AcrQcAnalyser {
      * longo da largura (x). Equivale ao getProfile de um retangulo vertical no
      * ImageJ (media das colunas), usado na macro com a tecla 'alt'.
      */
-    private static double[] rectColumnProfile(ImageProcessor ip, Calibration cal,
-                                              double xLeftPx, double yTopPx, double wPx, int hPx) {
-        int x0 = (int) Math.round(xLeftPx);
-        int y0 = (int) Math.round(yTopPx);
-        int w = Math.max(1, (int) Math.round(wPx));
-        double[] prof = new double[Math.max(1, hPx)];
+    private static double[] rectColumnProfile(ImageProcessor ip, Calibration cal, Rectangle bounds) {
+        int x0 = bounds.x;
+        int y0 = bounds.y;
+        int w = Math.max(1, bounds.width);
+        double[] prof = new double[Math.max(1, bounds.height)];
         for (int k = 0; k < prof.length; k++) {
             int yi = y0 + k;
             double sum = 0; int n = 0;
@@ -806,12 +882,6 @@ public class AcrQcAnalyser {
     private static double arrMax(double[] a) {
         double m = -Double.MAX_VALUE;
         for (double v : a) if (v > m) m = v;
-        return m;
-    }
-
-    private static double arrMin(double[] a) {
-        double m = Double.MAX_VALUE;
-        for (double v : a) if (v < m) m = v;
         return m;
     }
 
@@ -884,11 +954,19 @@ public class AcrQcAnalyser {
 
         // Fundo local da regiao (mediana aproximada via media central) para medir
         // o contraste dos pinos acima do fundo.
-        double bg = measureOval(ip, ls.cal, cPx[0], cPx[1], 10.0 / ls.px, "bg").mean;
+        OvalRoi pinBackgroundRoi = ovalRoi(cPx[0], cPx[1], 10.0 / ls.px);
+        double bg = measureRoi(ip, ls.cal, pinBackgroundRoi, "bg").mean;
+        addRoiRecord(r.rois, pinBackgroundRoi, "Distancia | Fundo local", slice, "Distancia");
 
         // Par nominal (orientacao esperada).
-        double[] n1 = localMaxHU(ip, ls, (PIN_T1_X_MM + offX) / ls.px, (PIN_T1_Y_MM + offY) / ls.py);
-        double[] n2 = localMaxHU(ip, ls, (PIN_T2_X_MM + offX) / ls.px, (PIN_T2_Y_MM + offY) / ls.py);
+        double n1x = (PIN_T1_X_MM + offX) / ls.px;
+        double n1y = (PIN_T1_Y_MM + offY) / ls.py;
+        double n2x = (PIN_T2_X_MM + offX) / ls.px;
+        double n2y = (PIN_T2_Y_MM + offY) / ls.py;
+        addRoiRecord(r.rois, pinSearchWindow(ls, n1x, n1y), "Distancia | Busca nominal P1", slice, "Distancia");
+        addRoiRecord(r.rois, pinSearchWindow(ls, n2x, n2y), "Distancia | Busca nominal P2", slice, "Distancia");
+        double[] n1 = localMaxHU(ip, ls, n1x, n1y);
+        double[] n2 = localMaxHU(ip, ls, n2x, n2y);
         double distNominal = Math.hypot((n2[0] - n1[0]) * ls.px, (n2[1] - n1[1]) * ls.py);
         double contrNominal = Math.min(n1[2] - bg, n2[2] - bg); // contraste do pino mais fraco
 
@@ -897,8 +975,14 @@ public class AcrQcAnalyser {
         double t1yInv = 2 * PIN_REF_CENTER_Y_MM - PIN_T1_Y_MM;
         double t2xInv = 2 * PIN_REF_CENTER_X_MM - PIN_T2_X_MM;
         double t2yInv = 2 * PIN_REF_CENTER_Y_MM - PIN_T2_Y_MM;
-        double[] i1 = localMaxHU(ip, ls, (t1xInv + offX) / ls.px, (t1yInv + offY) / ls.py);
-        double[] i2 = localMaxHU(ip, ls, (t2xInv + offX) / ls.px, (t2yInv + offY) / ls.py);
+        double i1x = (t1xInv + offX) / ls.px;
+        double i1y = (t1yInv + offY) / ls.py;
+        double i2x = (t2xInv + offX) / ls.px;
+        double i2y = (t2yInv + offY) / ls.py;
+        addRoiRecord(r.rois, pinSearchWindow(ls, i1x, i1y), "Distancia | Busca espelhada P1", slice, "Distancia");
+        addRoiRecord(r.rois, pinSearchWindow(ls, i2x, i2y), "Distancia | Busca espelhada P2", slice, "Distancia");
+        double[] i1 = localMaxHU(ip, ls, i1x, i1y);
+        double[] i2 = localMaxHU(ip, ls, i2x, i2y);
         double distInverted = Math.hypot((i2[0] - i1[0]) * ls.px, (i2[1] - i1[1]) * ls.py);
         double contrInverted = Math.min(i1[2] - bg, i2[2] - bg);
 
@@ -911,11 +995,15 @@ public class AcrQcAnalyser {
         r.pinDistanceV = distInverted;  // V = par espelhado
         r.pinMarkerCount = 2;
 
+        double[] chosen1;
+        double[] chosen2;
         double CONTRAST_MARGIN = 10.0; // HU
         if (contrInverted > contrNominal + CONTRAST_MARGIN) {
             r.pinDistance = distInverted;
             r.pinOrientation = "espelhado";
             r.pinPhantomInverted = true;
+            chosen1 = i1;
+            chosen2 = i2;
             r.pinNote = String.format(java.util.Locale.US,
                     "nominal=%.1f mm (contraste %.0f HU) | espelhado=%.1f mm (contraste %.0f HU) | "
                     + "usado: espelhado (VERIFICAR: phantom possivelmente invertido/rotacionado)",
@@ -924,11 +1012,28 @@ public class AcrQcAnalyser {
             r.pinDistance = distNominal;
             r.pinOrientation = "nominal";
             r.pinPhantomInverted = false;
+            chosen1 = n1;
+            chosen2 = n2;
             String warn = (contrNominal < 5.0) ? " (pinos com baixo contraste \u2014 conferir)" : "";
             r.pinNote = String.format(java.util.Locale.US,
                     "nominal=%.1f mm (contraste %.0f HU) | espelhado=%.1f mm (contraste %.0f HU) | usado: nominal%s",
                     distNominal, contrNominal, distInverted, contrInverted, warn);
         }
+
+        addRoiRecord(r.rois, new PointRoi(chosen1[0], chosen1[1]),
+                "Distancia | Pino 1 escolhido", slice, "Distancia");
+        addRoiRecord(r.rois, new PointRoi(chosen2[0], chosen2[1]),
+                "Distancia | Pino 2 escolhido", slice, "Distancia");
+        addRoiRecord(r.rois, new Line(chosen1[0], chosen1[1], chosen2[0], chosen2[1]),
+                String.format(java.util.Locale.US, "Distancia | Linha medida %.2f mm", r.pinDistance),
+                slice, "Distancia");
+    }
+
+    private static Roi pinSearchWindow(LoadedSeries ls, double gx, double gy) {
+        int cx = (int) Math.round(gx);
+        int cy = (int) Math.round(gy);
+        int sr = (int) Math.round(PIN_SEARCH_RADIUS_MM / ls.px);
+        return new Roi(cx - sr, cy - sr, 2 * sr + 1, 2 * sr + 1);
     }
 
     /** Busca o maximo de HU numa janela de 5mm ao redor de (gx,gy) em pixels. */
@@ -955,6 +1060,14 @@ public class AcrQcAnalyser {
         return String.format(java.util.Locale.US, "%.2f", v).replace('.', ',');
     }
 
+    private static String fmtMean(Measure m) {
+        return m != null && m.valid ? fmt(m.mean) : "N/A";
+    }
+
+    private static String fmtSd(Measure m) {
+        return m != null && m.valid ? fmt(m.sd) : "N/A";
+    }
+
     // ------------------------------------------------------------------
     // Pipeline de qualidade de imagem: TTF, NPS e NPWE (d')
     //
@@ -973,7 +1086,7 @@ public class AcrQcAnalyser {
         public double[] ttfFreqSel;          // TTF do insert de menor contraste
         public double[] ttfDataSel;
 
-        // NPS (todas as fatias uniformes, ROIs 80mm, raio 80mm)
+        // NPS (fatias centrais do modulo uniforme, afastadas das interfaces)
         public double[] npsFreq;
         public double[] npsData;
         public double[][] nps2D;
@@ -982,6 +1095,11 @@ public class AcrQcAnalyser {
         public double npsPeakFreq = Double.NaN;
         public double npsMeanFreq = Double.NaN;
         public int npsSlicesUsed = 0;
+        public int npsRoisUsed = 0;
+        public int ttfSlicesUsed = 0;
+        public double npsRoiSizeMm = NPS_ROI_SIZE_MM;
+        public double npsDistributionRadiusMm = NPS_DIST_RADIUS_MM;
+        public final List<RoiRecord> rois = new ArrayList<>();
 
         // d' / AUC (tarefa 6mm diametro -> raio 3mm, 6 HU)
         public double dPrime = Double.NaN;
@@ -1006,8 +1124,8 @@ public class AcrQcAnalyser {
     /**
      * Executa o pipeline de qualidade de imagem (TTF, NPS, d') seguindo os
      * requisitos de CQ:
-     *   - NPS em TODAS as fatias uniformes do phantom, ROIs quadradas de 80mm e
-     *     raio de distribuicao de 80mm.
+     *   - NPS nas fatias centrais do modulo uniforme, afastadas das interfaces,
+     *     com ROIs quadradas de 30mm distribuidas em um raio de 60mm.
      *   - TTF nas fatias do Modulo 1, ignorando a primeira e a ultima (bordas).
      *   - NPWE (d') para o insert de MENOR contraste, tarefa de 6mm de diametro
      *     (raio 3mm) e 6 HU, usando os parametros de visualizacao fornecidos.
@@ -1071,13 +1189,6 @@ public class AcrQcAnalyser {
         return q;
     }
 
-    /**
-     * Rejeita fatias de uniformidade contaminadas por volume parcial do modulo
-     * vizinho (ex.: resquicio dos beads nas fatias de borda), que apresentam
-     * ruido central anomalo. Mede o desvio padrao num ROI central de cada fatia
-     * e descarta as que excedem 1.5x a mediana do conjunto. Mantem ao menos as
-     * fatias mais limpas.
-     */
     // Margem de seguranca (mm) para afastar as fatias de NPS das INTERFACES
     // entre modulos do phantom. Cada modulo do ACR tem 40mm; proximo das
     // interfaces ha volume parcial do modulo vizinho (ex.: beads) que contamina
@@ -1158,6 +1269,20 @@ public class AcrQcAnalyser {
             TtfCalc.mtfResult mtf = TtfCalc.analisarStackComInserts(sub, ls.cal, det, 128);
             if (mtf == null || mtf.ttfs.isEmpty()) return;
             q.ttf = mtf;
+            q.ttfSlicesUsed = slices.size();
+
+            // Guarda os contornos efetivamente usados pela TTF, traduzindo a
+            // posicao local do substack para a fatia global da serie.
+            for (int insertId = 0; insertId < det.rois.size(); insertId++) {
+                List<Roi> sliceRois = det.rois.get(insertId);
+                if (sliceRois == null) continue;
+                int count = Math.min(sliceRois.size(), slices.size());
+                for (int j = 0; j < count; j++) {
+                    addRoiRecord(q.rois, sliceRois.get(j),
+                            String.format(java.util.Locale.US, "TTF | Inserto %02d | contorno", insertId + 1),
+                            slices.get(j), "TTF");
+                }
+            }
 
             // Insert de MENOR contraste (|I1 - I0| minimo, ou menor contraste registrado).
             int bestId = -1;
@@ -1192,20 +1317,28 @@ public class AcrQcAnalyser {
 
         double[][] sumNPS2D = new double[roiSizePx][roiSizePx];
         int validRecords = 0;
+        int validSlices = 0;
         double sumVariance = 0.0;
 
         for (int z : slices) {
+            int recordsBeforeSlice = validRecords;
             ImageProcessor ip = ls.stack.getProcessor(z);
             PolygonRoi phantom = Segmenter.segmenter(ip, ls.cal, -200, 5000, 0.2, false, 0, 20);
             if (phantom == null) continue;
+            addRoiRecord(q.rois, phantom, "NPS | Contorno do phantom", z, "NPS");
             List<Roi> records = Segmenter.createCircularRecordRois(
                     ip, ls.cal, phantom, NPS_NUM_ROIS, roiSizePx, distRadiusPx, false, z);
 
+            int roiNumber = 0;
             for (Roi rec : records) {
+                roiNumber++;
                 ip.setRoi(rec);
                 ImageProcessor crop = ip.crop();
                 ip.resetRoi();
                 if (crop.getWidth() != roiSizePx || crop.getHeight() != roiSizePx) continue;
+
+                addRoiRecord(q.rois, rec,
+                        String.format(java.util.Locale.US, "NPS | ROI %02d", roiNumber), z, "NPS");
 
                 ImageStatistics st = ImageStatistics.getStatistics(crop);
                 int N = crop.getWidth() * crop.getHeight();
@@ -1225,10 +1358,12 @@ public class AcrQcAnalyser {
                         sumNPS2D[y][x] += ps[y][x];
                 validRecords++;
             }
+            if (validRecords > recordsBeforeSlice) validSlices++;
         }
 
         if (validRecords == 0) { q.message = "Nenhum ROI valido para NPS."; return; }
-        q.npsSlicesUsed = slices.size();
+        q.npsSlicesUsed = validSlices;
+        q.npsRoisUsed = validRecords;
         q.npsVariance = sumVariance / validRecords;
 
         for (int y = 0; y < roiSizePx; y++)
@@ -1271,20 +1406,20 @@ public class AcrQcAnalyser {
         String T = "\t";
         sb.append(fmt(r.sliceThicknessTop)).append(T)
           .append(fmt(r.sliceThicknessBottom)).append(T)
-          .append(fmt(r.airIn.mean)).append(T).append(fmt(r.airIn.sd)).append(T)
-          .append(fmt(r.poly.mean)).append(T).append(fmt(r.poly.sd)).append(T)
-          .append(fmt(r.water.mean)).append(T).append(fmt(r.water.sd)).append(T)
-          .append(fmt(r.acrylic.mean)).append(T).append(fmt(r.acrylic.sd)).append(T)
-          .append(fmt(r.bone.mean)).append(T).append(fmt(r.bone.sd)).append(T)
-          .append(fmt(r.airOut.mean)).append(T).append(fmt(r.airOut.sd)).append(T)
-          .append(fmt(r.lcSignal.mean)).append(T)
-          .append(fmt(r.lcBackground.mean)).append(T).append(fmt(r.lcBackground.sd)).append(T)
+          .append(fmtMean(r.airIn)).append(T).append(fmtSd(r.airIn)).append(T)
+          .append(fmtMean(r.poly)).append(T).append(fmtSd(r.poly)).append(T)
+          .append(fmtMean(r.water)).append(T).append(fmtSd(r.water)).append(T)
+          .append(fmtMean(r.acrylic)).append(T).append(fmtSd(r.acrylic)).append(T)
+          .append(fmtMean(r.bone)).append(T).append(fmtSd(r.bone)).append(T)
+          .append(fmtMean(r.airOut)).append(T).append(fmtSd(r.airOut)).append(T)
+          .append(fmtMean(r.lcSignal)).append(T)
+          .append(fmtMean(r.lcBackground)).append(T).append(fmtSd(r.lcBackground)).append(T)
           .append(fmt(r.cnr)).append(T)
-          .append(fmt(r.uTop.mean)).append(T).append(fmt(r.uTop.sd)).append(T)
-          .append(fmt(r.uBottom.mean)).append(T).append(fmt(r.uBottom.sd)).append(T)
-          .append(fmt(r.uLeft.mean)).append(T).append(fmt(r.uLeft.sd)).append(T)
-          .append(fmt(r.uRight.mean)).append(T).append(fmt(r.uRight.sd)).append(T)
-          .append(fmt(r.uCenter.mean)).append(T).append(fmt(r.uCenter.sd)).append(T)
+          .append(fmtMean(r.uTop)).append(T).append(fmtSd(r.uTop)).append(T)
+          .append(fmtMean(r.uBottom)).append(T).append(fmtSd(r.uBottom)).append(T)
+          .append(fmtMean(r.uLeft)).append(T).append(fmtSd(r.uLeft)).append(T)
+          .append(fmtMean(r.uRight)).append(T).append(fmtSd(r.uRight)).append(T)
+          .append(fmtMean(r.uCenter)).append(T).append(fmtSd(r.uCenter)).append(T)
           .append(fmt(r.noise)).append(T)
           .append(fmt(r.pinDistance));
         return sb.toString();
